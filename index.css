@@ -12,7 +12,7 @@ button { background: #238636; color: #fff; border: 0; border-radius: 6px; paddin
 button:hover { background: #2ea043; }
 .notes { color: #d29922; font-size: 12px; margin: 0 20px; padding: 0 16px; }
 .wrap { padding: 8px 20px 40px; overflow-x: auto; }
-table { border-collapse: collapse; width: 100%; min-width: 880px; }
+table { border-collapse: collapse; width: 100%; min-width: 1200px; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #21262d; white-space: nowrap; }
 th { color: #8b949e; font-weight: 600; cursor: pointer; user-select: none; position: sticky; top: 0; background: #0d1117; }
 th:hover { color: #e6edf3; }

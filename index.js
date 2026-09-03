@@ -67,21 +67,24 @@ function render() {
   const outT = +document.getElementById("outT").value || 0;
   const aggRanks = aggRankIndex();
   const vals = valueIndex(window.ROWS, slug, inT, outT, aggRanks);
-  const label = (window.BENCH.find(b => b.slug === slug) || {}).label || slug;
-  const isAggregated = slug === "aggregated";
 
   const rows = window.ROWS.map(r => {
-    const b = isAggregated ? (aggRanks[r.id] ?? null) : r.benchmarks[slug];
     const cpr = (r.costIn!=null && r.costOut!=null)
       ? (inT/1e6)*r.costIn + (outT/1e6)*r.costOut : null;
-    return { ...r, _bench: b, _cpr: cpr, _val: vals[r.id] ?? null };
+    return {
+      ...r,
+      _cpr: cpr,
+      _val: vals[r.id] ?? null,
+      _aggRank: aggRanks[r.id] ?? null,
+    };
   });
 
-  const numLike = (k) => ["rank","costPerRequest","costIn","costOut","bench","val"].includes(k);
+  const numLike = (k) => ["rank","costPerRequest","costIn","costOut","scicode","tau2","lcr","aggRank","val"].includes(k);
   rows.sort((a,b) => {
     let av, bv;
     if (sortKey === "val") { av = a._val; bv = b._val; }
-    else if (sortKey === "bench") { av = a._bench; bv = b._bench; }
+    else if (sortKey === "aggRank") { av = a._aggRank; bv = b._aggRank; }
+    else if (sortKey === "scicode" || sortKey === "tau2" || sortKey === "lcr") { av = a.benchmarks[sortKey]; bv = b.benchmarks[sortKey]; }
     else if (sortKey === "costPerRequest") { av = a._cpr; bv = b._cpr; }
     else { av = a[sortKey]; bv = b[sortKey]; }
     if (av == null) av = -Infinity; if (bv == null) bv = -Infinity;
@@ -100,8 +103,9 @@ function render() {
     const valCell = r._val == null
       ? '<span class="na">—</span>'
       : '<span class="val">'+r._val.toFixed(1)+'</span> <span class="bar" style="width:'+barW+'px"></span>';
-    const benchCell = r._bench == null ? '<span class="na">—</span>' : fmt(r._bench, r._bench >= 1 ? 0 : 3);
     const cprCell = r._cpr == null ? '<span class="na">—</span>' : fmtUsd(r._cpr);
+    const benchCell = (v) => v == null ? '<span class="na">—</span>' : fmt(v, v >= 1 ? 0 : 3);
+    const aggRankCell = r._aggRank == null ? '<span class="na">—</span>' : r._aggRank.toFixed(0);
     const tr = document.createElement("tr");
     tr.innerHTML =
       '<td class="num rank">'+(hasScore? medal+rank : '<span class="na">–</span>')+'</td>'+
@@ -111,10 +115,17 @@ function render() {
       '<td class="num">'+cprCell+'</td>'+
       '<td class="num">'+(r.costIn==null?'<span class="na">—</span>':fmtUsd(r.costIn))+'</td>'+
       '<td class="num">'+(r.costOut==null?'<span class="na">—</span>':fmtUsd(r.costOut))+'</td>'+
-      '<td class="num" title="'+escapeHtml(label)+'">'+benchCell+'</td>'+
+      '<td class="num">'+benchCell(r.benchmarks.scicode)+'</td>'+
+      '<td class="num">'+benchCell(r.benchmarks.tau2)+'</td>'+
+      '<td class="num">'+benchCell(r.benchmarks.lcr)+'</td>'+
+      '<td class="num">'+aggRankCell+'</td>'+
       '<td class="num">'+valCell+'</td>';
     tb.appendChild(tr);
   }
+  document.querySelectorAll("th").forEach(th => {
+    th.classList.toggle("active", th.dataset.k === sortKey);
+  });
+}
   document.querySelectorAll("th").forEach(th => {
     th.classList.toggle("active", th.dataset.k === sortKey);
   });
