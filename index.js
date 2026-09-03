@@ -81,7 +81,7 @@ function render() {
     };
   });
 
-  const numLike = (k) => ["rank","costPerRequest","costIn","costOut","scicode","tau2","lcr","aggScore","val"].includes(k);
+  const numLike = (k) => ["costPerRequest","costIn","costOut","scicode","tau2","lcr","aggScore","val"].includes(k);
   rows.sort((a,b) => {
     let av, bv;
     if (sortKey === "val") { av = a._val; bv = b._val; }
@@ -96,19 +96,15 @@ function render() {
 
   const tb = document.getElementById("tbody");
   tb.innerHTML = "";
-  let rank = 0;
   for (const r of rows) {
-    const hasScore = r._val != null;
-    if (hasScore) rank++;
     const valCell = r._val == null
       ? '<span class="na">—</span>'
       : r._val.toFixed(1);
     const cprCell = r._cpr == null ? '<span class="na">—</span>' : fmtUsd(r._cpr);
     const benchCell = (v) => v == null ? '<span class="na">—</span>' : fmt(v, v >= 1 ? 0 : 3);
-    const aggScoreCell = r._aggScore == null ? '<span class="na">—</span>' : (r._aggScore * 100).toFixed(0) + '%';
+    const aggScoreCell = r._aggScore == null ? '<span class="na">—</span>' : (r._aggScore * 100).toFixed(1);
     const tr = document.createElement("tr");
     tr.innerHTML =
-      '<td class="num rank">'+(hasScore? rank : '<span class="na">–</span>')+'</td>'+
       '<td>'+escapeHtml(r.name)+' <span class="pill">'+escapeHtml(r.id)+'</span></td>'+
       '<td>'+(r.creator?escapeHtml(r.creator):'<span class="na">—</span>')+'</td>'+
       '<td>'+(r.releaseDate||'<span class="na">—</span>')+'</td>'+
