@@ -88,6 +88,7 @@ function render() {
     else if (sortKey === "aggScore") { av = a._aggScore; bv = b._aggScore; }
     else if (sortKey === "scicode" || sortKey === "tau2" || sortKey === "lcr") { av = a.benchmarks[sortKey]; bv = b.benchmarks[sortKey]; }
     else if (sortKey === "costPerRequest") { av = a._cpr; bv = b._cpr; }
+    else if (sortKey === "id") { av = a.id; bv = b.id; }
     else { av = a[sortKey]; bv = b[sortKey]; }
     if (av == null) av = -Infinity; if (bv == null) bv = -Infinity;
     if (typeof av === "string") return sortDir * av.localeCompare(bv);
@@ -105,7 +106,7 @@ function render() {
     const aggScoreCell = r._aggScore == null ? '<span class="na">—</span>' : (r._aggScore * 100).toFixed(1);
     const tr = document.createElement("tr");
     tr.innerHTML =
-      '<td>'+escapeHtml(r.name)+' <span class="pill">'+escapeHtml(r.id)+'</span></td>'+
+      '<td>'+escapeHtml(r.id)+'</td>'+
       '<td>'+(r.creator?escapeHtml(r.creator):'<span class="na">—</span>')+'</td>'+
       '<td>'+(r.releaseDate||'<span class="na">—</span>')+'</td>'+
       '<td class="num">'+cprCell+'</td>'+
