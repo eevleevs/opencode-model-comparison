@@ -19,6 +19,7 @@ table { border-collapse: collapse; width: 100%; min-width: 1200px; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #21262d; white-space: nowrap; }
 th { color: #8b949e; font-weight: 600; cursor: pointer; user-select: none; position: sticky; top: 0; background: #0d1117; }
 th:hover { color: #e6edf3; }
+th.active { text-decoration: underline; color: #e6edf3; }
 td.num, th.num { text-align: right; }
 tr:nth-child(even) td { background: #11161d; }
 .na { color: #6e7681; }
