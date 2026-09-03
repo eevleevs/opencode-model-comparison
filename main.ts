@@ -407,10 +407,10 @@ function renderHtml(data: {
     : "";
 
   return htmlTemplate!
-    .replace("{{updatedAt}}", escapeHtml(updatedAt))
-    .replace("{{noteHtml}}", noteHtml)
-    .replace("{{rowJson}}", rowJson)
-    .replace("{{benchJson}}", benchJson);
+    .replace("__updatedAt__", escapeHtml(updatedAt))
+    .replace("__noteHtml__", noteHtml)
+    .replace("__rowJson__", rowJson)
+    .replace("__benchJson__", benchJson);
 }
 
 async function handler(req: Request): Promise<Response> {

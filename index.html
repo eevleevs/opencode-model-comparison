@@ -13,13 +13,13 @@
     <div class="sub">
       Latest models on OpenCode Go, ranked by coding benchmark performance × utilization.
       <br />
-      Sources: opencode.ai/zen/go, cloudprice.net · updated {{ updatedAt }} ·
+      Sources: opencode.ai/zen/go, cloudprice.net · updated __updatedAt__ ·
       <a href="/?refresh=1">refresh data</a>
     </div>
   </div>
 </header>
 
-{{ noteHtml }}
+__noteHtml__
 
 <div class="wrap">
   <table id="tbl">
@@ -29,8 +29,8 @@
 </div>
 
 <script>
-  window.ROWS = {{ rowJson }};
-  window.BENCH = {{ benchJson }};
+  window.ROWS = __rowJson__;
+  window.BENCH = __benchJson__;
 </script>
 <script src="/index.js?v=12"></script>
   </body>
