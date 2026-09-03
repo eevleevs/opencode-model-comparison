@@ -100,10 +100,9 @@ function render() {
   for (const r of rows) {
     const hasScore = r._val != null;
     if (hasScore) rank++;
-    const barW = r._val != null ? Math.max(2, r._val) : 0;
     const valCell = r._val == null
       ? '<span class="na">—</span>'
-      : '<span class="val">'+r._val.toFixed(1)+'</span> <span class="bar" style="width:'+barW+'px"></span>';
+      : r._val.toFixed(1);
     const cprCell = r._cpr == null ? '<span class="na">—</span>' : fmtUsd(r._cpr);
     const benchCell = (v) => v == null ? '<span class="na">—</span>' : fmt(v, v >= 1 ? 0 : 3);
     const aggScoreCell = r._aggScore == null ? '<span class="na">—</span>' : (r._aggScore * 100).toFixed(0) + '%';

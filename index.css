@@ -22,8 +22,6 @@ th:hover { color: #e6edf3; }
 td.num, th.num { text-align: right; }
 tr:nth-child(even) td { background: #11161d; }
 .rank { font-weight: 700; }
-.bar { display: inline-block; height: 8px; background: #388bfd; border-radius: 4px; vertical-align: middle; }
-.val { color: #3fb950; font-weight: 600; }
 .na { color: #6e7681; }
 a { color: #58a6ff; text-decoration: none; }
 .pill { font-size: 11px; color: #8b949e; border: 1px solid #30363d; border-radius: 999px; padding: 1px 8px; }
