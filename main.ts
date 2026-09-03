@@ -15,7 +15,6 @@ const BENCHMARKS = [
   { slug: "scicode", label: "SciCode", coding: true, api: true },
   { slug: "tau2", label: "TAU2 (agentic)", coding: true, api: true },
   { slug: "lcr", label: "LCR (long-context)", coding: true, api: true },
-  { slug: "aggregated", label: "Aggregated (avg rank)", coding: true, api: false, invert: true },
 ];
 
 const DEFAULT_IN_TOKENS = 6000;
@@ -233,8 +232,6 @@ async function buildData(): Promise<{
 }
 
 function valueIndex(rows: Row[], slug: string, inT: number, outT: number): Map<string, number> {
-  const bench = BENCHMARKS.find((b) => b.slug === slug);
-  const invert = bench?.invert ?? false;
   const scored: { id: string; v: number }[] = [];
   for (const r of rows) {
     const b = r.benchmarks[slug];
@@ -244,8 +241,7 @@ function valueIndex(rows: Row[], slug: string, inT: number, outT: number): Map<s
       ? (inT / 1e6) * cIn + (outT / 1e6) * cOut
       : null;
     if (cpr == null || cpr <= 0) continue;
-    const score = invert ? 1 / b : b;
-    scored.push({ id: r.id, v: score / cpr });
+    scored.push({ id: r.id, v: b / cpr });
   }
   const max = Math.max(...scored.map((s) => s.v), 0);
   const map = new Map<string, number>();

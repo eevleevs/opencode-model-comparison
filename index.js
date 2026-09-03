@@ -11,22 +11,19 @@ function escapeHtml(s) {
     .replace(/'/g, "&#39;");
 }
 
-function valueIndex(rows, slug, inT, outT, aggRanks) {
-  const bench = window.BENCH.find(b => b.slug === slug);
-  const invert = bench?.invert ?? false;
+function valueIndex(rows, slug, inT, outT, aggScores) {
   const scored = [];
   for (const r of rows) {
     let b = r.benchmarks[slug];
-    // For aggregated benchmark, use the client-computed aggRanks
+    // For aggregated benchmark, use the client-computed normalized scores
     if (slug === "aggregated") {
-      b = aggRanks?.[r.id] ?? null;
+      b = aggScores?.[r.id] ?? null;
     }
     if (b == null) continue;
     if (r.costIn == null || r.costOut == null) continue;
     const cpr = (inT/1e6)*r.costIn + (outT/1e6)*r.costOut;
     if (cpr <= 0) continue;
-    const score = invert ? (1 / b) : b;
-    scored.push({ id: r.id, v: score / cpr });
+    scored.push({ id: r.id, v: b / cpr });
   }
   const max = Math.max(0, ...scored.map(s => s.v));
   const m = {};
@@ -36,27 +33,33 @@ function valueIndex(rows, slug, inT, outT, aggRanks) {
 
 let sortKey = "val", sortDir = -1;
 
-function aggRankIndex() {
-  const ranks = {};
+function aggScoreIndex() {
+  const scores = {};
+  const counts = {};
   for (const b of window.BENCH) {
     if (!b.api) continue;
-    const scored = [];
+    const values = [];
+    for (const r of window.ROWS) {
+      const score = r.benchmarks[b.slug];
+      if (score != null) values.push(score);
+    }
+    if (values.length === 0) continue;
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    const range = max - min || 1;
     for (const r of window.ROWS) {
       const score = r.benchmarks[b.slug];
       if (score == null) continue;
-      scored.push({ id: r.id, score });
+      const normalized = (score - min) / range;
+      if (!scores[r.id]) scores[r.id] = 0;
+      if (!counts[r.id]) counts[r.id] = 0;
+      scores[r.id] += normalized;
+      counts[r.id]++;
     }
-    scored.sort((a, b) => b.score - a.score);
-    scored.forEach((s, i) => {
-      const rank = i + 1;
-      if (!ranks[s.id]) ranks[s.id] = { sum: 0, count: 0 };
-      ranks[s.id].sum += rank;
-      ranks[s.id].count++;
-    });
   }
   const result = {};
-  for (const id of Object.keys(ranks)) {
-    if (ranks[id].count > 0) result[id] = ranks[id].sum / ranks[id].count;
+  for (const id of Object.keys(scores)) {
+    result[id] = scores[id] / counts[id];
   }
   return result;
 }
@@ -64,8 +67,8 @@ function aggRankIndex() {
 function render() {
   const inT = +document.getElementById("inT").value || 0;
   const outT = +document.getElementById("outT").value || 0;
-  const aggRanks = aggRankIndex();
-  const vals = valueIndex(window.ROWS, "aggregated", inT, outT, aggRanks);
+  const aggScores = aggScoreIndex();
+  const vals = valueIndex(window.ROWS, "aggregated", inT, outT, aggScores);
 
   const rows = window.ROWS.map(r => {
     const cpr = (r.costIn!=null && r.costOut!=null)
@@ -74,15 +77,15 @@ function render() {
       ...r,
       _cpr: cpr,
       _val: vals[r.id] ?? null,
-      _aggRank: aggRanks[r.id] ?? null,
+      _aggScore: aggScores[r.id] ?? null,
     };
   });
 
-  const numLike = (k) => ["rank","costPerRequest","costIn","costOut","scicode","tau2","lcr","aggRank","val"].includes(k);
+  const numLike = (k) => ["rank","costPerRequest","costIn","costOut","scicode","tau2","lcr","aggScore","val"].includes(k);
   rows.sort((a,b) => {
     let av, bv;
     if (sortKey === "val") { av = a._val; bv = b._val; }
-    else if (sortKey === "aggRank") { av = a._aggRank; bv = b._aggRank; }
+    else if (sortKey === "aggScore") { av = a._aggScore; bv = b._aggScore; }
     else if (sortKey === "scicode" || sortKey === "tau2" || sortKey === "lcr") { av = a.benchmarks[sortKey]; bv = b.benchmarks[sortKey]; }
     else if (sortKey === "costPerRequest") { av = a._cpr; bv = b._cpr; }
     else { av = a[sortKey]; bv = b[sortKey]; }
@@ -104,7 +107,7 @@ function render() {
       : '<span class="val">'+r._val.toFixed(1)+'</span> <span class="bar" style="width:'+barW+'px"></span>';
     const cprCell = r._cpr == null ? '<span class="na">—</span>' : fmtUsd(r._cpr);
     const benchCell = (v) => v == null ? '<span class="na">—</span>' : fmt(v, v >= 1 ? 0 : 3);
-    const aggRankCell = r._aggRank == null ? '<span class="na">—</span>' : r._aggRank.toFixed(0);
+    const aggScoreCell = r._aggScore == null ? '<span class="na">—</span>' : (r._aggScore * 100).toFixed(0) + '%';
     const tr = document.createElement("tr");
     tr.innerHTML =
       '<td class="num rank">'+(hasScore? medal+rank : '<span class="na">–</span>')+'</td>'+
@@ -117,7 +120,7 @@ function render() {
       '<td class="num">'+benchCell(r.benchmarks.scicode)+'</td>'+
       '<td class="num">'+benchCell(r.benchmarks.tau2)+'</td>'+
       '<td class="num">'+benchCell(r.benchmarks.lcr)+'</td>'+
-      '<td class="num">'+aggRankCell+'</td>'+
+      '<td class="num">'+aggScoreCell+'</td>'+
       '<td class="num">'+valCell+'</td>';
     tb.appendChild(tr);
   }
