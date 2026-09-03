@@ -62,11 +62,10 @@ function aggRankIndex() {
 }
 
 function render() {
-  const slug = document.getElementById("bench").value;
   const inT = +document.getElementById("inT").value || 0;
   const outT = +document.getElementById("outT").value || 0;
   const aggRanks = aggRankIndex();
-  const vals = valueIndex(window.ROWS, slug, inT, outT, aggRanks);
+  const vals = valueIndex(window.ROWS, "aggregated", inT, outT, aggRanks);
 
   const rows = window.ROWS.map(r => {
     const cpr = (r.costIn!=null && r.costOut!=null)
@@ -126,14 +125,9 @@ function render() {
     th.classList.toggle("active", th.dataset.k === sortKey);
   });
 }
-  document.querySelectorAll("th").forEach(th => {
-    th.classList.toggle("active", th.dataset.k === sortKey);
-  });
-}
 
 function savePrefs() {
   localStorage.setItem("lb-prefs", JSON.stringify({
-    slug: document.getElementById("bench").value,
     inT: +document.getElementById("inT").value,
     outT: +document.getElementById("outT").value,
   }));
@@ -141,7 +135,6 @@ function savePrefs() {
 
 // Initialize from saved preferences
 const saved = JSON.parse(localStorage.getItem("lb-prefs") || "{}");
-document.getElementById("bench").value = saved.slug ?? "aggregated";
 document.getElementById("inT").value = saved.inT ?? window.DEFAULT_IN_TOKENS;
 document.getElementById("outT").value = saved.outT ?? window.DEFAULT_OUT_TOKENS;
 
@@ -153,6 +146,5 @@ document.querySelectorAll("th").forEach(th => {
   });
 });
 document.getElementById("apply").addEventListener("click", () => { savePrefs(); render(); });
-document.getElementById("bench").addEventListener("change", () => { savePrefs(); render(); });
 
 render();
