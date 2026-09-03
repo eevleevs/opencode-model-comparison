@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>OpenCode Go — Coding Model Value Leaderboard</title>
+<link rel="stylesheet" href="/index.css" />
+</head>
+<body>
+<header>
+  <h1>OpenCode Go — Coding Model Value Leaderboard</h1>
+  <div class="sub">
+    Latest models on OpenCode Go, ranked by coding benchmark performance per dollar.
+    Sources: opencode.ai/zen/go, models.dev, cloudprice.net · updated {{updatedAt}} ·
+    <a href="/?refresh=1">refresh data</a>
+  </div>
+</header>
+
+<div class="controls">
+  <label>Input tokens / request
+    <input id="inT" type="number" value="{{defaultInT}}" min="0" step="500" />
+  </label>
+  <label>Output tokens / request
+    <input id="outT" type="number" value="{{defaultOutT}}" min="0" step="500" />
+  </label>
+  <button id="apply">Apply</button>
+</div>
+
+{{noteHtml}}
+
+<div class="wrap">
+  <table id="tbl">
+    <thead><tr>
+      <th class="num" data-k="rank">#</th>
+      <th data-k="name">Model</th>
+      <th data-k="creator">Creator</th>
+      <th data-k="releaseDate">Released</th>
+      <th class="num" data-k="costPerRequest">$ / req</th>
+      <th class="num" data-k="scicode">SciCode</th>
+      <th class="num" data-k="tau2">TAU2</th>
+      <th class="num" data-k="lcr">LCR</th>
+      <th class="num" data-k="aggRank">Agg Rank</th>
+      <th class="num" data-k="val">Value</th>
+    </tr></thead>
+    <tbody id="tbody"></tbody>
+  </table>
+</div>
+
+<script>
+  window.ROWS = {{rowJson}};
+  window.BENCH = {{benchJson}};
+  window.DEFAULT_IN_TOKENS = {{defaultInT}};
+  window.DEFAULT_OUT_TOKENS = {{defaultOutT}};
+</script>
+<script src="/index.js?v=3"></script>
+</body>
+</html>
