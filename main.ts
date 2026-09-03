@@ -142,7 +142,11 @@ async function fetchGoLimits(
   }
 
   console.log("[build] fetching Go docs MDX...");
-  const mdx = await fetchJson(GO_DOCS_URL);
+  const res = await fetch(GO_DOCS_URL, {
+    headers: { "user-agent": "opencode-go-leaderboard/1.0" },
+  });
+  if (!res.ok) throw new Error(`GET ${GO_DOCS_URL} -> ${res.status}`);
+  const mdx = await res.text();
   const tables = parseMarkdownTables(mdx);
 
   const endpointsTable = findTable(tables, "Model ID");
@@ -192,8 +196,8 @@ type BuildResult = Awaited<ReturnType<typeof buildData>>;
 
 async function getBuildData(forceRefresh = false): Promise<BuildResult> {
   if (forceRefresh) {
-    // Explicitly delete old cache before fetching fresh data
     await kv.delete(KV_KEY);
+    await kv.delete(["go-limits"]);
   } else {
     const entry = await kv.get<BuildResult>(KV_KEY);
     if (entry.value) return entry.value;
