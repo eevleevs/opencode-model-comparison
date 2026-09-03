@@ -89,8 +89,9 @@ async function fetchModelsDev(): Promise<any> {
 }
 
 // Pull one benchmark leaderboard, paginating through every entry.
-async function fetchLeaderboard(slug: string): Promise<Map<string, number>> {
-  const out = new Map<string, number>();
+async function fetchLeaderboard(slug: string): Promise<{ values: Map<string, number>; creators: Map<string, string> }> {
+  const values = new Map<string, number>();
+  const creators = new Map<string, string>();
   let token: string | undefined;
   let guard = 0;
   do {
@@ -100,11 +101,12 @@ async function fetchLeaderboard(slug: string): Promise<Map<string, number>> {
     const d = await fetchJson(url.toString());
     const rows: any[] = d.data ?? [];
     for (const r of rows) {
-      if (typeof r.value === "number") out.set(r.model_id, r.value);
+      if (typeof r.value === "number") values.set(r.model_id, r.value);
+      if (r.creator) creators.set(r.model_id, r.creator);
     }
     token = d.pagination?.has_next ? d.pagination.next_token : undefined;
   } while (token && guard++ < 100);
-  return out;
+  return { values, creators };
 }
 
 type Row = {
@@ -142,14 +144,18 @@ async function buildData(): Promise<{
   // 3) Benchmarks only — skip the full CloudPrice catalog to save requests.
   // Rate limit: 20 requests/minute. We need ~12 total (3 benchmarks × ~4 pages), so minimal delays.
   const benchMaps: Record<string, Map<string, number>> = {};
+  const creatorMaps: Record<string, Map<string, string>> = {};
   for (const b of BENCHMARKS) {
     if (!b.api) continue;
     console.log(`[build] fetching ${b.slug}...`);
     try {
-      benchMaps[b.slug] = await fetchLeaderboard(b.slug);
-      console.log(`[build] ${b.slug}: ${benchMaps[b.slug].size} entries`);
+      const result = await fetchLeaderboard(b.slug);
+      benchMaps[b.slug] = result.values;
+      creatorMaps[b.slug] = result.creators;
+      console.log(`[build] ${b.slug}: ${result.values.size} entries`);
     } catch (e) {
       benchMaps[b.slug] = new Map();
+      creatorMaps[b.slug] = new Map();
       notes.push(`Benchmark ${b.slug} unavailable: ${(e as Error).message}`);
     }
   }
@@ -167,6 +173,7 @@ async function buildData(): Promise<{
     // Match each benchmark independently (different benchmarks may use different ID formats).
     const benchmarks: Record<string, number | null> = {};
     let matchedAny = false;
+    let creator = "";
     for (const b of BENCHMARKS) {
       if (!b.api) {
         benchmarks[b.slug] = null;
@@ -176,16 +183,18 @@ async function buildData(): Promise<{
       for (const key of benchMaps[b.slug].keys()) {
         if (norm(key) === norm(id) || norm(key).endsWith(norm(id)) || norm(id).endsWith(norm(key))) {
           benchValue = benchMaps[b.slug].get(key) ?? null;
+          if (!creator) creator = creatorMaps[b.slug].get(key) ?? "";
           break;
         }
       }
       benchmarks[b.slug] = benchValue;
       if (benchValue != null) matchedAny = true;
     }
-    // Extract creator from model ID (e.g., "minimax-m3" -> "minimax")
-    let creator = "";
-    const parts = id.split(/[-.]/);
-    if (parts.length > 1) creator = parts[0];
+    // Fallback: extract creator from model ID (e.g., "minimax-m3" -> "minimax")
+    if (!creator) {
+      const parts = id.split(/[-.]/);
+      if (parts.length > 1) creator = parts[0];
+    }
     if (matchedAny) {
       matchedCount++;
       withBenchmarks++;

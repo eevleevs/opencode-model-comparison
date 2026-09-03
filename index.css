@@ -1,9 +1,10 @@
 :root { color-scheme: dark; }
 * { box-sizing: border-box; }
 body { margin: 0; background: #0d1117; color: #e6edf3; font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-header { padding: 24px 20px 8px; border-bottom: 1px solid #21262d; }
+header { display: grid; grid-template-columns: 1fr auto; gap: 20px; padding: 24px 20px 8px; border-bottom: 1px solid #21262d; align-items: start; }
+.header-left { min-width: 0; }
 h1 { margin: 0 0 12px; font-size: 20px; }
-header .controls { display: flex; gap: 14px; align-items: flex-end; justify-content: flex-end; margin-bottom: 12px; }
+header .controls { display: flex; gap: 14px; align-items: flex-end; }
 header .controls label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: #8b949e; }
 select, input { background: #161b22; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 6px 8px; font: inherit; }
 input[type=number] { width: 110px; }
