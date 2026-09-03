@@ -100,7 +100,6 @@ function render() {
   for (const r of rows) {
     const hasScore = r._val != null;
     if (hasScore) rank++;
-    const medal = rank <= 3 ? '<span class="medal">★</span> ' : "";
     const barW = r._val != null ? Math.max(2, r._val) : 0;
     const valCell = r._val == null
       ? '<span class="na">—</span>'
@@ -110,7 +109,7 @@ function render() {
     const aggScoreCell = r._aggScore == null ? '<span class="na">—</span>' : (r._aggScore * 100).toFixed(0) + '%';
     const tr = document.createElement("tr");
     tr.innerHTML =
-      '<td class="num rank">'+(hasScore? medal+rank : '<span class="na">–</span>')+'</td>'+
+      '<td class="num rank">'+(hasScore? rank : '<span class="na">–</span>')+'</td>'+
       '<td>'+escapeHtml(r.name)+' <span class="pill">'+escapeHtml(r.id)+'</span></td>'+
       '<td>'+(r.creator?escapeHtml(r.creator):'<span class="na">—</span>')+'</td>'+
       '<td>'+(r.releaseDate||'<span class="na">—</span>')+'</td>'+

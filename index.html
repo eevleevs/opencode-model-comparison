@@ -9,22 +9,22 @@
 <body>
 <header>
   <h1>OpenCode Go — Coding Model Value Leaderboard</h1>
+  <div class="controls">
+    <label>Input tokens / request
+      <input id="inT" type="number" value="{{defaultInT}}" min="0" step="5" />
+    </label>
+    <label>Output tokens / request
+      <input id="outT" type="number" value="{{defaultOutT}}" min="0" step="5" />
+    </label>
+    <button id="apply">Apply</button>
+  </div>
   <div class="sub">
     Latest models on OpenCode Go, ranked by coding benchmark performance per dollar.
+    <br />
     Sources: opencode.ai/zen/go, models.dev, cloudprice.net · updated {{updatedAt}} ·
     <a href="/?refresh=1">refresh data</a>
   </div>
 </header>
-
-<div class="controls">
-  <label>Input tokens / request
-    <input id="inT" type="number" value="{{defaultInT}}" min="0" step="500" />
-  </label>
-  <label>Output tokens / request
-    <input id="outT" type="number" value="{{defaultOutT}}" min="0" step="500" />
-  </label>
-  <button id="apply">Apply</button>
-</div>
 
 {{noteHtml}}
 
@@ -41,6 +41,6 @@
   window.DEFAULT_IN_TOKENS = {{defaultInT}};
   window.DEFAULT_OUT_TOKENS = {{defaultOutT}};
 </script>
-<script src="/index.js?v=5"></script>
+<script src="/index.js?v=6"></script>
 </body>
 </html>
