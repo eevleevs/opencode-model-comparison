@@ -1,12 +1,12 @@
 // OpenCode Go Model Leaderboard
-// Fetches the latest models available on OpenCode Go, their per-token cost
-// (from models.dev), and coding benchmarks (from CloudPrice), then ranks them
-// by a "value" score = benchmark performance / cost per request.
+// Fetches the latest models available on OpenCode Go, their utilization limits
+// (from the Go docs), and coding benchmarks (from CloudPrice), then ranks them
+// by a "value" score = benchmark performance × requests per month.
 //
-// Deploy: `deno run --allow-net main.ts` (or push to Deno Deploy).
+// Deploy: `deno run --allow-net --allow-read --unstable-kv main.ts`
 
 const OC_GO_MODELS_URL = "https://opencode.ai/zen/go/v1/models";
-const MODELSDEV_URL = "https://models.dev/api.json";
+const GO_DOCS_URL = "https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/web/src/content/docs/go.mdx";
 const CLOUDPRICE = "https://ai.cloudprice.net/api/v1";
 
 // Benchmarks we pull from CloudPrice. `coding: true` marks the ones that are
@@ -16,9 +16,6 @@ const BENCHMARKS = [
   { slug: "tau2", label: "TAU2 (agentic)", coding: true, api: true },
   { slug: "lcr", label: "LCR (long-context)", coding: true, api: true },
 ];
-
-const DEFAULT_IN_TOKENS = 6000;
-const DEFAULT_OUT_TOKENS = 2000;
 
 function norm(s: string): string {
   return (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -64,6 +61,112 @@ async function fetchJson(url: string, attempts = 4): Promise<any> {
   throw lastErr ?? new Error(`GET ${url} failed`);
 }
 
+// Parse Markdown tables from MDX source
+function parseTableRow(line: string): string[] {
+  return line
+    .trim()
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split("|")
+    .map((cell) => cell.trim());
+}
+
+function parseMarkdownTables(text: string): Map<string, { headers: string[]; rows: string[][] }> {
+  const tables = new Map<string, { headers: string[]; rows: string[][] }>();
+  const lines = text.split("\n");
+  let i = 0;
+
+  while (i < lines.length) {
+    if (lines[i].trim().startsWith("|")) {
+      const tableLines: string[] = [];
+      while (i < lines.length && lines[i].trim().startsWith("|")) {
+        tableLines.push(lines[i]);
+        i++;
+      }
+
+      if (tableLines.length >= 3) {
+        const headers = parseTableRow(tableLines[0]);
+        const rows: string[][] = [];
+        for (let j = 2; j < tableLines.length; j++) {
+          rows.push(parseTableRow(tableLines[j]));
+        }
+        tables.set(headers.join("|"), { headers, rows });
+      }
+    } else {
+      i++;
+    }
+  }
+
+  return tables;
+}
+
+function findTable(tables: Map<string, { headers: string[]; rows: string[][] }>, headerMatch: string) {
+  for (const [, table] of tables) {
+    if (table.headers.some((h) => h.includes(headerMatch))) {
+      return table;
+    }
+  }
+  return null;
+}
+
+type GoLimits = {
+  limits: Record<string, { reqPer5h: number; reqPerWeek: number; reqPerMonth: number }>;
+  fetchedAt: number;
+};
+
+const GO_LIMITS_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+async function fetchGoLimits(forceRefresh = false): Promise<GoLimits["limits"]> {
+  const kvKey = ["go-limits"];
+
+  if (!forceRefresh) {
+    const entry = await kv.get<GoLimits>(kvKey);
+    if (entry.value && Date.now() - entry.value.fetchedAt < GO_LIMITS_TTL_MS) {
+      return entry.value.limits;
+    }
+  }
+
+  console.log("[build] fetching Go docs MDX...");
+  const mdx = await fetchJson(GO_DOCS_URL);
+  const tables = parseMarkdownTables(mdx);
+
+  const endpointsTable = findTable(tables, "Model ID");
+  const requestsTable = findTable(tables, "requests per 5 hour");
+
+  if (!endpointsTable || !requestsTable) {
+    throw new Error("Failed to parse Go docs tables");
+  }
+
+  // Build displayName -> id map from Endpoints table
+  const displayNameToId = new Map<string, string>();
+  for (const row of endpointsTable.rows) {
+    const displayName = row[0];
+    const modelId = row[1];
+    if (displayName && modelId) {
+      displayNameToId.set(displayName, modelId);
+    }
+  }
+
+  // Build limits map keyed by model id
+  const limits: GoLimits["limits"] = {};
+  for (const row of requestsTable.rows) {
+    const displayName = row[0];
+    const reqPer5h = parseInt(row[1]?.replace(/,/g, ""), 10);
+    const reqPerWeek = parseInt(row[2]?.replace(/,/g, ""), 10);
+    const reqPerMonth = parseInt(row[3]?.replace(/,/g, ""), 10);
+
+    const id = displayNameToId.get(displayName);
+    if (id && !isNaN(reqPer5h) && !isNaN(reqPerWeek) && !isNaN(reqPerMonth)) {
+      limits[id] = { reqPer5h, reqPerWeek, reqPerMonth };
+    }
+  }
+
+  console.log(`[build] parsed ${Object.keys(limits).length} model limits from Go docs`);
+
+  await kv.set(kvKey, { limits, fetchedAt: Date.now() });
+  return limits;
+}
+
 // Deno KV for persistent caching
 const kv = await Deno.openKv();
 const KV_KEY = ["leaderboard", "data"];
@@ -82,10 +185,6 @@ async function getBuildData(forceRefresh = false): Promise<BuildResult> {
   const data = await buildData();
   await kv.set(KV_KEY, data);
   return data;
-}
-
-async function fetchModelsDev(): Promise<any> {
-  return fetchJson(MODELSDEV_URL);
 }
 
 // Pull one benchmark leaderboard, paginating through every entry.
@@ -114,9 +213,9 @@ type Row = {
   name: string;
   creator: string;
   releaseDate: string | null;
-  costIn: number | null;
-  costOut: number | null;
-  costPerRequest: number | null;
+  reqPer5h: number | null;
+  reqPerWeek: number | null;
+  reqPerMonth: number | null;
   benchmarks: Record<string, number | null>;
   matched: boolean;
 };
@@ -133,16 +232,15 @@ async function buildData(): Promise<{
   const ocRes = await fetchJson(OC_GO_MODELS_URL);
   const ocIds: string[] = ocRes.data.map((m: any) => m.id);
 
-  // 2) models.dev -> opencode-go provider gives cost + display name + release.
-  const md = await fetchModelsDev();
-  const ocProvider = md["opencode-go"] ?? {};
-  const ocModels: Record<string, any> = ocProvider.models ?? {};
-  if (!ocModels || Object.keys(ocModels).length === 0) {
-    notes.push("models.dev opencode-go provider unavailable; cost shown as N/A.");
+  // 2) Go utilization limits from docs (KV-cached, 7-day TTL).
+  let goLimits: Record<string, { reqPer5h: number; reqPerWeek: number; reqPerMonth: number }> = {};
+  try {
+    goLimits = await fetchGoLimits();
+  } catch (e) {
+    notes.push(`Go limits fetch failed: ${(e as Error).message}`);
   }
 
-  // 3) Benchmarks only — skip the full CloudPrice catalog to save requests.
-  // Rate limit: 20 requests/minute. We need ~12 total (3 benchmarks × ~4 pages), so minimal delays.
+  // 3) Benchmarks from CloudPrice.
   const benchMaps: Record<string, Map<string, number>> = {};
   const creatorMaps: Record<string, Map<string, string>> = {};
   for (const b of BENCHMARKS) {
@@ -165,10 +263,7 @@ async function buildData(): Promise<{
   let withBenchmarks = 0;
 
   for (const id of ocIds) {
-    const mdModel = ocModels[id];
-    const name = mdModel?.name ?? id;
-    const costIn = mdModel?.cost?.input ?? null;
-    const costOut = mdModel?.cost?.output ?? null;
+    const limits = goLimits[id] ?? null;
 
     // Match each benchmark independently (different benchmarks may use different ID formats).
     const benchmarks: Record<string, number | null> = {};
@@ -200,20 +295,14 @@ async function buildData(): Promise<{
       withBenchmarks++;
     }
 
-    const costPerRequest = costIn !== null && costOut !== null
-      ? (DEFAULT_IN_TOKENS / 1e6) * costIn + (DEFAULT_OUT_TOKENS / 1e6) * costOut
-      : null;
-
-    let releaseDate: string | null = mdModel?.release_date ?? null;
-
     rows.push({
       id,
-      name,
+      name: id,
       creator,
-      releaseDate,
-      costIn,
-      costOut,
-      costPerRequest,
+      releaseDate: null,
+      reqPer5h: limits?.reqPer5h ?? null,
+      reqPerWeek: limits?.reqPerWeek ?? null,
+      reqPerMonth: limits?.reqPerMonth ?? null,
       benchmarks,
       matched: matchedAny,
     });
@@ -240,17 +329,14 @@ async function buildData(): Promise<{
   };
 }
 
-function valueIndex(rows: Row[], slug: string, inT: number, outT: number): Map<string, number> {
+function valueIndex(rows: Row[], slug: string): Map<string, number> {
   const scored: { id: string; v: number }[] = [];
   for (const r of rows) {
     const b = r.benchmarks[slug];
     if (b == null) continue;
-    const cIn = r.costIn, cOut = r.costOut;
-    const cpr = cIn !== null && cOut !== null
-      ? (inT / 1e6) * cIn + (outT / 1e6) * cOut
-      : null;
-    if (cpr == null || cpr <= 0) continue;
-    scored.push({ id: r.id, v: b / cpr });
+    const rpm = r.reqPerMonth;
+    if (rpm == null) continue;
+    scored.push({ id: r.id, v: b * rpm });
   }
   const max = Math.max(...scored.map((s) => s.v), 0);
   const map = new Map<string, number>();
@@ -272,9 +358,6 @@ function renderHtml(data: {
   notes: string[];
 }): string {
   const { rows, benchmarks, updatedAt, notes } = data;
-  const codingOpts = benchmarks
-    .map((b) => `<option value="${b.slug}">${escapeHtml(b.label)}${b.coding ? " (coding)" : ""}</option>`)
-    .join("");
   const rowJson = JSON.stringify(rows).replace(/</g, "\\u003c");
   const benchJson = JSON.stringify(benchmarks).replace(/</g, "\\u003c");
 
@@ -284,9 +367,6 @@ function renderHtml(data: {
 
   return htmlTemplate!
     .replace("{{updatedAt}}", escapeHtml(updatedAt))
-    .replace("{{codingOpts}}", codingOpts)
-    .replace(/{{defaultInT}}/g, String(DEFAULT_IN_TOKENS))
-    .replace(/{{defaultOutT}}/g, String(DEFAULT_OUT_TOKENS))
     .replace("{{noteHtml}}", noteHtml)
     .replace("{{rowJson}}", rowJson)
     .replace("{{benchJson}}", benchJson);

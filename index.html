@@ -11,20 +11,11 @@
   <div class="header-left">
     <h1>OpenCode Go — Coding Model Value Leaderboard</h1>
     <div class="sub">
-      Latest models on OpenCode Go, ranked by coding benchmark performance per dollar.
+      Latest models on OpenCode Go, ranked by coding benchmark performance × utilization.
       <br />
-      Sources: opencode.ai/zen/go, models.dev, cloudprice.net · updated {{updatedAt}} ·
+      Sources: opencode.ai/zen/go, cloudprice.net · updated {{updatedAt}} ·
       <a href="/?refresh=1">refresh data</a>
     </div>
-  </div>
-  <div class="controls">
-    <label>Input tokens / request
-      <input id="inT" type="number" value="{{defaultInT}}" min="0" step="5" />
-    </label>
-    <label>Output tokens / request
-      <input id="outT" type="number" value="{{defaultOutT}}" min="0" step="5" />
-    </label>
-    <button id="apply">Apply</button>
   </div>
 </header>
 
@@ -32,7 +23,7 @@
 
 <div class="wrap">
   <table id="tbl">
-    <thead><tr><th data-k="id">Model</th><th data-k="creator">Creator</th><th data-k="releaseDate">Released</th><th class="num" data-k="costPerRequest">$/request</th><th class="num" data-k="costIn">$in/1M</th><th class="num" data-k="costOut">$out/1M</th><th class="num" data-k="scicode">SciCode</th><th class="num" data-k="tau2">TAU2</th><th class="num" data-k="lcr">LCR</th><th class="num" data-k="aggScore">AggScore</th><th class="num" data-k="val">Value</th></tr></thead>
+    <thead><tr><th data-k="id">Model</th><th data-k="creator">Creator</th><th data-k="releaseDate">Released</th><th class="num" data-k="reqPer5h">Req/5h</th><th class="num" data-k="reqPerWeek">Req/wk</th><th class="num" data-k="reqPerMonth">Req/mo</th><th class="num" data-k="scicode">SciCode</th><th class="num" data-k="tau2">TAU2</th><th class="num" data-k="lcr">LCR</th><th class="num" data-k="aggBench">AggBench</th><th class="num" data-k="val">Value</th></tr></thead>
     <tbody id="tbody"></tbody>
   </table>
 </div>
@@ -40,9 +31,7 @@
 <script>
   window.ROWS = {{rowJson}};
   window.BENCH = {{benchJson}};
-  window.DEFAULT_IN_TOKENS = {{defaultInT}};
-  window.DEFAULT_OUT_TOKENS = {{defaultOutT}};
 </script>
-<script src="/index.js?v=11"></script>
+<script src="/index.js?v=12"></script>
 </body>
 </html>
