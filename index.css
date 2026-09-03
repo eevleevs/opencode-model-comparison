@@ -1,17 +1,76 @@
-:root { color-scheme: dark; }
-* { box-sizing: border-box; }
-body { margin: 0; background: #0d1117; color: #e6edf3; font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-header { padding: 24px 20px 8px; border-bottom: 1px solid #21262d; }
-h1 { margin: 0 0 4px; font-size: 20px; }
-.sub { color: #8b949e; font-size: 12px; }
-.notes { color: #d29922; font-size: 12px; margin: 0 20px; padding: 0 16px; }
-.wrap { padding: 8px 20px 40px; overflow-x: auto; }
-table { border-collapse: collapse; width: 100%; min-width: 1200px; }
-th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #21262d; white-space: nowrap; }
-th { color: #8b949e; font-weight: 600; cursor: pointer; user-select: none; position: sticky; top: 0; background: #0d1117; }
-th:hover { color: #e6edf3; }
-th.active { text-decoration: underline; color: #e6edf3; }
-td.num, th.num { text-align: right; }
-tr:nth-child(even) td { background: #11161d; }
-.na { color: #6e7681; }
-a { color: #58a6ff; text-decoration: none; }
+:root {
+  color-scheme: dark;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  background: #0d1117;
+  color: #e6edf3;
+  font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+header {
+  padding: 24px 20px 8px;
+  border-bottom: 1px solid #21262d;
+}
+h1 {
+  margin: 0 0 4px;
+  font-size: 20px;
+}
+.sub {
+  color: #8b949e;
+  font-size: 12px;
+}
+.notes {
+  color: #d29922;
+  font-size: 12px;
+  margin: 0 20px;
+  padding: 0 16px;
+}
+.wrap {
+  padding: 8px 20px 40px;
+  overflow-x: auto;
+}
+table {
+  border-collapse: collapse;
+  width: 100%;
+  min-width: 1200px;
+}
+th,
+td {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid #21262d;
+  white-space: nowrap;
+}
+th {
+  color: #8b949e;
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+  position: sticky;
+  top: 0;
+  background: #0d1117;
+}
+th:hover {
+  color: #e6edf3;
+}
+th.active {
+  text-decoration: underline;
+  color: #e6edf3;
+}
+td.num,
+th.num {
+  text-align: right;
+}
+tr:nth-child(even) td {
+  background: #11161d;
+}
+.na {
+  color: #6e7681;
+}
+a {
+  color: #58a6ff;
+  text-decoration: none;
+}

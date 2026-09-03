@@ -6,7 +6,8 @@
 // Deploy: `deno run --allow-net --allow-read --unstable-kv main.ts`
 
 const OC_GO_MODELS_URL = "https://opencode.ai/zen/go/v1/models";
-const GO_DOCS_URL = "https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/web/src/content/docs/go.mdx";
+const GO_DOCS_URL =
+  "https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/web/src/content/docs/go.mdx";
 const CLOUDPRICE = "https://ai.cloudprice.net/api/v1";
 
 // Benchmarks we pull from CloudPrice. `coding: true` marks the ones that are
@@ -44,7 +45,11 @@ async function fetchJson(url: string, attempts = 4): Promise<any> {
         const delay = Number.isFinite(retryAfter) && retryAfter > 0
           ? Math.min(retryAfter * 1000, 10000)
           : 2000 * 2 ** i;
-        console.log(`[fetch] 429 rate limited on ${url}, retrying in ${delay}ms (attempt ${i + 1}/${attempts})`);
+        console.log(
+          `[fetch] 429 rate limited on ${url}, retrying in ${delay}ms (attempt ${
+            i + 1
+          }/${attempts})`,
+        );
         await sleep(delay);
         continue;
       }
@@ -71,7 +76,9 @@ function parseTableRow(line: string): string[] {
     .map((cell) => cell.trim());
 }
 
-function parseMarkdownTables(text: string): Map<string, { headers: string[]; rows: string[][] }> {
+function parseMarkdownTables(
+  text: string,
+): Map<string, { headers: string[]; rows: string[][] }> {
   const tables = new Map<string, { headers: string[]; rows: string[][] }>();
   const lines = text.split("\n");
   let i = 0;
@@ -100,7 +107,10 @@ function parseMarkdownTables(text: string): Map<string, { headers: string[]; row
   return tables;
 }
 
-function findTable(tables: Map<string, { headers: string[]; rows: string[][] }>, headerMatch: string) {
+function findTable(
+  tables: Map<string, { headers: string[]; rows: string[][] }>,
+  headerMatch: string,
+) {
   for (const [, table] of tables) {
     if (table.headers.some((h) => h.includes(headerMatch))) {
       return table;
@@ -110,13 +120,18 @@ function findTable(tables: Map<string, { headers: string[]; rows: string[][] }>,
 }
 
 type GoLimits = {
-  limits: Record<string, { reqPer5h: number; reqPerWeek: number; reqPerMonth: number }>;
+  limits: Record<
+    string,
+    { reqPer5h: number; reqPerWeek: number; reqPerMonth: number }
+  >;
   fetchedAt: number;
 };
 
 const GO_LIMITS_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
-async function fetchGoLimits(forceRefresh = false): Promise<GoLimits["limits"]> {
+async function fetchGoLimits(
+  forceRefresh = false,
+): Promise<GoLimits["limits"]> {
   const kvKey = ["go-limits"];
 
   if (!forceRefresh) {
@@ -161,7 +176,9 @@ async function fetchGoLimits(forceRefresh = false): Promise<GoLimits["limits"]> 
     }
   }
 
-  console.log(`[build] parsed ${Object.keys(limits).length} model limits from Go docs`);
+  console.log(
+    `[build] parsed ${Object.keys(limits).length} model limits from Go docs`,
+  );
 
   await kv.set(kvKey, { limits, fetchedAt: Date.now() });
   return limits;
@@ -188,7 +205,9 @@ async function getBuildData(forceRefresh = false): Promise<BuildResult> {
 }
 
 // Pull one benchmark leaderboard, paginating through every entry.
-async function fetchLeaderboard(slug: string): Promise<{ values: Map<string, number>; creators: Map<string, string> }> {
+async function fetchLeaderboard(
+  slug: string,
+): Promise<{ values: Map<string, number>; creators: Map<string, string> }> {
   const values = new Map<string, number>();
   const creators = new Map<string, string>();
   let token: string | undefined;
@@ -233,7 +252,10 @@ async function buildData(): Promise<{
   const ocIds: string[] = ocRes.data.map((m: any) => m.id);
 
   // 2) Go utilization limits from docs (KV-cached, 7-day TTL).
-  let goLimits: Record<string, { reqPer5h: number; reqPerWeek: number; reqPerMonth: number }> = {};
+  let goLimits: Record<
+    string,
+    { reqPer5h: number; reqPerWeek: number; reqPerMonth: number }
+  > = {};
   try {
     goLimits = await fetchGoLimits();
   } catch (e) {
@@ -276,7 +298,10 @@ async function buildData(): Promise<{
       }
       let benchValue: number | null = null;
       for (const key of benchMaps[b.slug].keys()) {
-        if (norm(key) === norm(id) || norm(key).endsWith(norm(id)) || norm(id).endsWith(norm(key))) {
+        if (
+          norm(key) === norm(id) || norm(key).endsWith(norm(id)) ||
+          norm(id).endsWith(norm(key))
+        ) {
           benchValue = benchMaps[b.slug].get(key) ?? null;
           if (!creator) creator = creatorMaps[b.slug].get(key) ?? "";
           break;
@@ -308,7 +333,9 @@ async function buildData(): Promise<{
     });
   }
 
-  console.log(`[build] matched ${matchedCount}/${ocIds.length} models to CloudPrice, ${withBenchmarks} have at least one benchmark`);
+  console.log(
+    `[build] matched ${matchedCount}/${ocIds.length} models to CloudPrice, ${withBenchmarks} have at least one benchmark`,
+  );
   for (const b of BENCHMARKS) {
     if (!b.api) continue;
     const count = rows.filter((r) => r.benchmarks[b.slug] != null).length;
@@ -345,11 +372,23 @@ function valueIndex(rows: Row[], slug: string): Map<string, number> {
 }
 
 function escapeHtml(s: string): string {
-  return s.replace(/[&<>"']/g, (c) =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
+  return s.replace(
+    /[&<>"']/g,
+    (
+      c,
+    ) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;",
+    }[c]!),
+  );
 }
 
-const htmlTemplate = await Deno.readTextFile(new URL("./index.html", import.meta.url));
+const htmlTemplate = await Deno.readTextFile(
+  new URL("./index.html", import.meta.url),
+);
 
 function renderHtml(data: {
   rows: Row[];
@@ -362,7 +401,9 @@ function renderHtml(data: {
   const benchJson = JSON.stringify(benchmarks).replace(/</g, "\\u003c");
 
   const noteHtml = notes.length
-    ? `<ul class="notes">${notes.map((n) => `<li>${escapeHtml(n)}</li>`).join("")}</ul>`
+    ? `<ul class="notes">${
+      notes.map((n) => `<li>${escapeHtml(n)}</li>`).join("")
+    }</ul>`
     : "";
 
   return htmlTemplate!
@@ -378,13 +419,21 @@ async function handler(req: Request): Promise<Response> {
   if (url.pathname === "/index.js") {
     const js = await Deno.readTextFile(new URL("./index.js", import.meta.url));
     return new Response(js, {
-      headers: { "content-type": "application/javascript; charset=utf-8", "cache-control": "public, max-age=3600" },
+      headers: {
+        "content-type": "application/javascript; charset=utf-8",
+        "cache-control": "public, max-age=3600",
+      },
     });
   }
   if (url.pathname === "/index.css") {
-    const css = await Deno.readTextFile(new URL("./index.css", import.meta.url));
+    const css = await Deno.readTextFile(
+      new URL("./index.css", import.meta.url),
+    );
     return new Response(css, {
-      headers: { "content-type": "text/css; charset=utf-8", "cache-control": "public, max-age=3600" },
+      headers: {
+        "content-type": "text/css; charset=utf-8",
+        "cache-control": "public, max-age=3600",
+      },
     });
   }
   // Browsers auto-request /favicon.ico; don't waste a full build on it.
@@ -396,14 +445,20 @@ async function handler(req: Request): Promise<Response> {
     const data = await getBuildData(forceRefresh);
     const html = renderHtml(data);
     return new Response(html, {
-      headers: { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=300" },
+      headers: {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "public, max-age=300",
+      },
     });
   } catch (e) {
     const msg = (e as Error).message;
-    return new Response(`<pre>Error building leaderboard:\n${escapeHtml(msg)}</pre>`, {
-      status: 500,
-      headers: { "content-type": "text/html; charset=utf-8" },
-    });
+    return new Response(
+      `<pre>Error building leaderboard:\n${escapeHtml(msg)}</pre>`,
+      {
+        status: 500,
+        headers: { "content-type": "text/html; charset=utf-8" },
+      },
+    );
   }
 }
 

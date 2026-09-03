@@ -1,25 +1,25 @@
 <!doctype html>
 <html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>OpenCode Go — Coding Model Value Leaderboard</title>
-<link rel="stylesheet" href="/index.css" />
-</head>
-<body>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenCode Go — Coding Model Value Leaderboard</title>
+    <link rel="stylesheet" href="/index.css" />
+  </head>
+  <body>
 <header>
   <div class="header-left">
     <h1>OpenCode Go — Coding Model Value Leaderboard</h1>
     <div class="sub">
       Latest models on OpenCode Go, ranked by coding benchmark performance × utilization.
       <br />
-      Sources: opencode.ai/zen/go, cloudprice.net · updated {{updatedAt}} ·
+      Sources: opencode.ai/zen/go, cloudprice.net · updated {{ updatedAt }} ·
       <a href="/?refresh=1">refresh data</a>
     </div>
   </div>
 </header>
 
-{{noteHtml}}
+{{ noteHtml }}
 
 <div class="wrap">
   <table id="tbl">
@@ -29,9 +29,9 @@
 </div>
 
 <script>
-  window.ROWS = {{rowJson}};
-  window.BENCH = {{benchJson}};
+  window.ROWS = {{ rowJson }};
+  window.BENCH = {{ benchJson }};
 </script>
 <script src="/index.js?v=12"></script>
-</body>
+  </body>
 </html>
