@@ -128,7 +128,6 @@ function render() {
       "<td>" +
       (r.creator ? escapeHtml(r.creator) : '<span class="na">—</span>') +
       "</td>" +
-      "<td>" + (r.releaseDate || '<span class="na">—</span>') + "</td>" +
       '<td class="num">' +
       (r.reqPer5h == null ? '<span class="na">—</span>' : fmtNum(r.reqPer5h)) +
       "</td>" +
