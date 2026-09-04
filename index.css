@@ -35,14 +35,14 @@ h1 {
 table {
   border-collapse: collapse;
   width: 100%;
-  min-width: 1200px;
 }
 th,
 td {
   text-align: left;
-  padding: 8px 10px;
+  padding: 6px 8px;
   border-bottom: 1px solid #21262d;
   white-space: nowrap;
+  font-size: 13px;
 }
 th {
   color: #8b949e;
