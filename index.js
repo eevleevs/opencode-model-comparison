@@ -1,4 +1,5 @@
 // Client-side leaderboard logic
+// deno-lint-ignore-file no-window
 const fmt = (n, d = 4) => n == null ? null : Number(n).toFixed(d);
 const fmtNum = (n) => n == null ? null : n.toLocaleString();
 
@@ -11,14 +12,58 @@ function escapeHtml(s) {
     .replace(/'/g, "&#39;");
 }
 
+const benchSlugs = window.BENCH.map((b) => b.slug);
+const isBenchKey = (k) => benchSlugs.includes(k);
+
+// Short display labels for benchmark <th> headers. These are the source of
+// truth for the UI; the `label` field in the cached BENCH JSON is ignored
+// so that header text stays current even if the KV cache is stale.
+const LABELS = {
+  scicode: "SciCode",
+  coding_index: "CodInd",
+  lcr: "LCR",
+  terminalbench_hard: "TermBench",
+  tau2: "TAU2",
+  ifbench: "IFBench",
+  intelligence_index: "IntInd",
+  gpqa: "GPQA",
+  hle: "HLE",
+};
+
+// Aggregate ranking: average the CloudPrice percentile (0-100) across each
+// model's available benchmarks. Percentile is on a common scale across mixed
+// 0-1 / 0-100 benchmarks, so no manual min-max normalization is needed.
+function aggBenchIndex() {
+  const sums = {};
+  const counts = {};
+  for (const r of window.ROWS) {
+    if (!r.percentiles) continue;
+    let s = 0, c = 0;
+    for (const slug of benchSlugs) {
+      const p = r.percentiles[slug];
+      if (typeof p === "number") {
+        s += p;
+        c++;
+      }
+    }
+    if (c > 0) {
+      sums[r.id] = s;
+      counts[r.id] = c;
+    }
+  }
+  const out = {};
+  for (const id of Object.keys(sums)) out[id] = sums[id] / counts[id];
+  return out;
+}
+
 function valueIndex(rows, aggScores) {
   const scored = [];
   for (const r of rows) {
-    const b = aggScores?.[r.id] ?? null;
-    if (b == null) continue;
+    const pct = aggScores?.[r.id] ?? null;
+    if (pct == null) continue;
     const rpm = r.reqPerMonth;
     if (rpm == null) continue;
-    scored.push({ id: r.id, v: b * rpm });
+    scored.push({ id: r.id, v: (pct / 100) * rpm });
   }
   const max = Math.max(0, ...scored.map((s) => s.v));
   const m = {};
@@ -27,37 +72,6 @@ function valueIndex(rows, aggScores) {
 }
 
 let sortKey = "val", sortDir = -1;
-
-function aggBenchIndex() {
-  const scores = {};
-  const counts = {};
-  for (const b of window.BENCH) {
-    if (!b.api) continue;
-    const values = [];
-    for (const r of window.ROWS) {
-      const score = r.benchmarks[b.slug];
-      if (score != null) values.push(score);
-    }
-    if (values.length === 0) continue;
-    const min = Math.min(...values);
-    const max = Math.max(...values);
-    const range = max - min || 1;
-    for (const r of window.ROWS) {
-      const score = r.benchmarks[b.slug];
-      if (score == null) continue;
-      const normalized = (score - min) / range;
-      if (!scores[r.id]) scores[r.id] = 0;
-      if (!counts[r.id]) counts[r.id] = 0;
-      scores[r.id] += normalized;
-      counts[r.id]++;
-    }
-  }
-  const result = {};
-  for (const id of Object.keys(scores)) {
-    result[id] = scores[id] / counts[id];
-  }
-  return result;
-}
 
 function render() {
   const aggScores = aggBenchIndex();
@@ -69,17 +83,6 @@ function render() {
     _aggBench: aggScores[r.id] ?? null,
   }));
 
-  const numLike = (k) =>
-    [
-      "reqPer5h",
-      "reqPerWeek",
-      "reqPerMonth",
-      "scicode",
-      "tau2",
-      "lcr",
-      "aggBench",
-      "val",
-    ].includes(k);
   rows.sort((a, b) => {
     let av, bv;
     if (sortKey === "val") {
@@ -88,9 +91,7 @@ function render() {
     } else if (sortKey === "aggBench") {
       av = a._aggBench;
       bv = b._aggBench;
-    } else if (
-      sortKey === "scicode" || sortKey === "tau2" || sortKey === "lcr"
-    ) {
+    } else if (isBenchKey(sortKey)) {
       av = a.benchmarks[sortKey];
       bv = b.benchmarks[sortKey];
     } else if (
@@ -122,9 +123,9 @@ function render() {
       v == null ? '<span class="na">—</span>' : fmt(v, v >= 1 ? 0 : 3);
     const aggBenchCell = r._aggBench == null
       ? '<span class="na">—</span>'
-      : (r._aggBench * 100).toFixed(1);
-    const tr = document.createElement("tr");
-    tr.innerHTML = "<td>" + escapeHtml(r.id) + "</td>" +
+      : r._aggBench.toFixed(1);
+
+    let html = "<td>" + escapeHtml(r.id) + "</td>" +
       "<td>" +
       (r.creator ? escapeHtml(r.creator) : '<span class="na">—</span>') +
       "</td>" +
@@ -138,18 +139,35 @@ function render() {
       '<td class="num">' + (r.reqPerMonth == null
         ? '<span class="na">—</span>'
         : fmtNum(r.reqPerMonth)) +
-      "</td>" +
-      '<td class="num">' + benchCell(r.benchmarks.scicode) + "</td>" +
-      '<td class="num">' + benchCell(r.benchmarks.tau2) + "</td>" +
-      '<td class="num">' + benchCell(r.benchmarks.lcr) + "</td>" +
-      '<td class="num">' + aggBenchCell + "</td>" +
+      "</td>";
+    for (const slug of benchSlugs) {
+      html += '<td class="num">' + benchCell(r.benchmarks[slug]) + "</td>";
+    }
+    html += '<td class="num">' + aggBenchCell + "</td>" +
       '<td class="num">' + valCell + "</td>";
+    const tr = document.createElement("tr");
+    tr.innerHTML = html;
     tb.appendChild(tr);
   }
   document.querySelectorAll("th").forEach((th) => {
     th.classList.toggle("active", th.dataset.k === sortKey);
   });
 }
+
+// Inject one <th> per benchmark into the static thead, between reqPerMonth
+// and AggBench, before any click handlers are attached.
+(function injectBenchHeaders() {
+  const benchHead = document.querySelector('th[data-k="aggBench"]');
+  if (!benchHead) return;
+  const tr = benchHead.parentElement;
+  for (const b of window.BENCH) {
+    const th = document.createElement("th");
+    th.className = "num";
+    th.dataset.k = b.slug;
+    th.textContent = LABELS[b.slug] ?? b.slug;
+    tr.insertBefore(th, benchHead);
+  }
+})();
 
 document.querySelectorAll("th").forEach((th) => {
   th.addEventListener("click", () => {

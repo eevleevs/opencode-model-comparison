@@ -13,6 +13,7 @@ body {
 header {
   padding: 24px 20px 8px;
   border-bottom: 1px solid #21262d;
+  margin: 0 auto;
 }
 h1 {
   margin: 0 0 4px;
@@ -25,12 +26,13 @@ h1 {
 .notes {
   color: #d29922;
   font-size: 12px;
-  margin: 0 20px;
   padding: 0 16px;
+  list-style-position: inside;
 }
 .wrap {
   padding: 8px 20px 40px;
   overflow-x: auto;
+  margin: 0 auto;
 }
 table {
   border-collapse: collapse;
@@ -39,10 +41,9 @@ table {
 th,
 td {
   text-align: left;
-  padding: 6px 8px;
+  padding: 8px 10px;
   border-bottom: 1px solid #21262d;
   white-space: nowrap;
-  font-size: 13px;
 }
 th {
   color: #8b949e;

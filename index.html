@@ -7,31 +7,38 @@
     <link rel="stylesheet" href="/index.css" />
   </head>
   <body>
-<header>
-  <div class="header-left">
-    <h1>OpenCode Go — Coding Model Value Leaderboard</h1>
-    <div class="sub">
-      Latest models on OpenCode Go, ranked by coding benchmark performance × utilization.
-      <br />
-      Sources: opencode.ai/zen/go, cloudprice.net · updated __updatedAt__ ·
-      <a href="/?refresh=1">refresh data</a>
+    <header>
+      <h1>OpenCode Go — Coding Model Value Leaderboard</h1>
+      <div class="sub">
+        Latest models on OpenCode Go, ranked by coding benchmark performance × utilization.
+        <br />
+        Sources: opencode.ai/zen/go, cloudprice.net · updated __updatedAt__ ·
+        <a href="/?refresh=1">refresh data</a>
+      </div>
+      __noteHtml__
+    </header>
+
+    <div class="wrap">
+      <table id="tbl">
+        <thead>
+          <tr>
+            <th data-k="id">Model</th>
+            <th data-k="creator">Creator</th>
+            <th class="num" data-k="reqPer5h">Req/5h</th>
+            <th class="num" data-k="reqPerWeek">Req/wk</th>
+            <th class="num" data-k="reqPerMonth">Req/mo</th>
+            <th class="num" data-k="aggBench">AggBench</th>
+            <th class="num" data-k="val">Value</th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
     </div>
-  </div>
-</header>
 
-__noteHtml__
-
-<div class="wrap">
-  <table id="tbl">
-    <thead><tr><th data-k="id">Model</th><th data-k="creator">Creator</th><th class="num" data-k="reqPer5h">Req/5h</th><th class="num" data-k="reqPerWeek">Req/wk</th><th class="num" data-k="reqPerMonth">Req/mo</th><th class="num" data-k="scicode">SciCode</th><th class="num" data-k="tau2">TAU2</th><th class="num" data-k="lcr">LCR</th><th class="num" data-k="aggBench">AggBench</th><th class="num" data-k="val">Value</th></tr></thead>
-    <tbody id="tbody"></tbody>
-  </table>
-</div>
-
-<script>
-  window.ROWS = __rowJson__;
-  window.BENCH = __benchJson__;
-</script>
-<script src="/index.js?v=12"></script>
+    <script>
+    window.ROWS = __rowJson__;
+    window.BENCH = __benchJson__;
+    </script>
+    <script src="/index.js?v=15"></script>
   </body>
 </html>
