@@ -3,9 +3,11 @@
 // (from the Go docs), and coding benchmarks (from CloudPrice), then ranks them
 // by a "value" score = benchmark performance × requests per month.
 //
-// KV stores the leaderboard permanently. A background refresh fetches models
-// one at a time (2 s cadence) so CloudPrice never gets hammered. The refresh
-// auto-triggers when the Go model list changes.
+// Deno Deploy is serverless: isolates idle-shutdown and requests that run too
+// long are killed (502). So NO request ever does more than one CloudPrice call.
+// Benchmark results are persisted per-model in KV as soon as each one is
+// fetched; the page always renders whatever is in KV immediately. A client
+// polls GET /?tick=1 (one model fetch per tick) until the leaderboard is full.
 //
 // Deploy: `deno run --allow-net --allow-read --unstable-kv main.ts`
 
@@ -27,49 +29,59 @@ const BENCHMARKS = [
 ];
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const REQ_TIMEOUT_MS = 20000;
 
-// Seconds between API calls during a background refresh.
-const CADENCE_MS = 2000;
+// Hard wall-clock budget for one tick request so it can never approach the
+// Deno Deploy request limit. CloudPrice replies in tens of ms normally; 15s
+// covers even pathological 429 retry-after values without sleeping forever.
+const TICK_BUDGET_MS = 15000;
+
+// 404/409/no-source results are persisted as tombstones so ticks don't retry
+// them forever. They expire, so models that later gain benchmarks refetch.
+const TOMBSTONE_TTL_MS = 24 * 60 * 60 * 1000;
+
+// Re-check the Go model list at most this often.
+const GO_LIST_CHECK_MS = 5 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
-async function fetchJson(url: string, attempts = 4): Promise<unknown> {
-  let lastErr: unknown;
-  for (let i = 0; i < attempts; i++) {
-    const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), REQ_TIMEOUT_MS);
-    try {
-      const res = await fetch(url, {
-        headers: { "user-agent": "opencode-go-leaderboard/1.0" },
-        signal: ac.signal,
-      });
-      clearTimeout(timer);
-      if (res.status === 429 && i < attempts - 1) {
-        const retryAfter = Number(res.headers.get("retry-after"));
-        const delay = Number.isFinite(retryAfter) && retryAfter > 0
-          ? Math.min(retryAfter * 1000, 10000)
-          : 2000 * 2 ** i;
-        console.log(
-          `[fetch] 429 on ${url}, retry in ${delay}ms (attempt ${
-            i + 1
-          }/${attempts})`,
-        );
-        await sleep(delay);
-        continue;
-      }
-      if (!res.ok) throw new Error(`GET ${url} -> ${res.status}`);
-      return res.json();
-    } catch (e) {
-      clearTimeout(timer);
-      lastErr = e;
-      if (e instanceof DOMException && e.name === "AbortError") break;
-      if (i < attempts - 1) await sleep(1000 * 2 ** i);
+async function fetchJson(url: string, timeoutMs: number): Promise<unknown> {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      headers: { "user-agent": "opencode-go-leaderboard/1.0" },
+      signal: ac.signal,
+    });
+    if (res.status === 429) {
+      const retryAfter = Number(res.headers.get("retry-after"));
+      const secs = Number.isFinite(retryAfter) && retryAfter > 0
+        ? retryAfter
+        : 10;
+      throw new RateLimitedError(secs * 1000);
     }
+    if (!res.ok) throw new HttpError(res.status, `GET ${url} -> ${res.status}`);
+    return res.json();
+  } finally {
+    clearTimeout(timer);
   }
-  throw lastErr ?? new Error(`GET ${url} failed`);
+}
+
+class RateLimitedError extends Error {
+  retryAfterMs: number;
+  constructor(retryAfterMs: number) {
+    super("rate limited");
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+class HttpError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -190,9 +202,12 @@ async function fetchGoLimits(
 // ---------------------------------------------------------------------------
 
 const kv = await Deno.openKv();
-const KV_LEADERBOARD = ["leaderboard", "data"];
-const KV_GO_IDS = ["go-models", "ids"];
-const KV_REFRESH_LOCK = ["refresh", "running"];
+const KV_GO_IDS = ["go", "ids"];
+const KV_GO_CHECKED = ["go", "checkedAt"];
+
+function kvModelKey(id: string): string[] {
+  return ["model", id];
+}
 
 // ---------------------------------------------------------------------------
 // Per-model benchmark fetch
@@ -202,17 +217,30 @@ type CpiScore = { metric: string; value?: number; percentile?: number };
 type CpiSource = { scores?: CpiScore[] };
 type CpiPayload = { data?: { sources?: CpiSource[] } };
 
-type ModelResult = {
+type ModelData = {
   value: Record<string, number>;
   percentile: Record<string, number>;
 };
 
-async function fetchModelBenchmarks(id: string): Promise<ModelResult | null> {
+type CachedModel =
+  | { data: ModelData; fetchedAt: number }
+  | { empty: true; fetchedAt: number };
+
+// One CloudPrice call for a single model. No retry-sleeping: 429/timeout fold
+// into a "not yet" result and the client retries a later tick.
+async function fetchModelOnce(
+  id: string,
+): Promise<{ kind: "ok"; data: ModelData } | { kind: "empty" } | {
+  kind: "rateLimited";
+  retryAfterMs: number;
+} | { kind: "error" }> {
   try {
-    const d =
-      (await fetchJson(`${CLOUDPRICE}/models/${id}/benchmarks`)) as CpiPayload;
+    const d = (await fetchJson(
+      `${CLOUDPRICE}/models/${id}/benchmarks`,
+      TICK_BUDGET_MS,
+    )) as CpiPayload;
     const srcs = d?.data?.sources ?? [];
-    if (!srcs.length) return null;
+    if (!srcs.length) return { kind: "empty" };
     const value: Record<string, number> = {};
     const percentile: Record<string, number> = {};
     for (const src of srcs) {
@@ -223,33 +251,68 @@ async function fetchModelBenchmarks(id: string): Promise<ModelResult | null> {
         }
       }
     }
-    return { value, percentile };
+    const data: ModelData = { value, percentile };
+    if (Object.keys(value).length === 0) return { kind: "empty" };
+    return { kind: "ok", data };
   } catch (e) {
-    console.log(`[build] no benchmarks for ${id}: ${(e as Error).message}`);
-    return null;
+    if (e instanceof RateLimitedError) {
+      console.log(`[tick] 429 on ${id}, retry in ${e.retryAfterMs}ms`);
+      return { kind: "rateLimited", retryAfterMs: e.retryAfterMs };
+    }
+    if (e instanceof HttpError && (e.status === 404 || e.status === 409)) {
+      console.log(`[tick] ${id} has no public benchmarks (${e.status})`);
+      return { kind: "empty" };
+    }
+    console.log(`[tick] fetch failed for ${id}: ${(e as Error).message}`);
+    return { kind: "error" };
   }
 }
 
 // ---------------------------------------------------------------------------
-// Go model list helpers
+// Go model list (change detection)
 // ---------------------------------------------------------------------------
 
 async function getGoModelIds(): Promise<string[]> {
-  const res = await fetchJson(OC_GO_MODELS_URL) as {
+  const res = await fetchJson(OC_GO_MODELS_URL, TICK_BUDGET_MS) as {
     data: { id: string }[];
   };
   return res.data.map((m) => m.id);
 }
 
-async function hasGoModelsChanged(currentIds: string[]): Promise<boolean> {
+async function ensureGoIds(): Promise<string[]> {
+  const checked = await kv.get<number>(KV_GO_CHECKED);
+  if (checked.value && Date.now() - checked.value < GO_LIST_CHECK_MS) {
+    const cached = await kv.get<string[]>(KV_GO_IDS);
+    if (cached.value) return cached.value;
+  }
+
+  const live = await getGoModelIds();
   const cached = await kv.get<string[]>(KV_GO_IDS);
-  if (!cached.value) return true;
-  if (currentIds.length !== cached.value.length) return true;
-  return !currentIds.every((id, i) => id === cached.value![i]);
+
+  if (!cached.value || !arraysEqual(live, cached.value)) {
+    console.log(
+      `[build] Go model list changed (${cached.value?.length ?? 0} -> ${live.length}), clearing model cache`,
+    );
+    const it = kv.list({ prefix: ["model"] });
+    const toDelete: Deno.KvKey[] = [];
+    for await (const entry of it) toDelete.push([...entry.key]);
+    for (const key of toDelete) await kv.delete(key);
+    await kv.set(KV_GO_IDS, live);
+  }
+  await kv.set(KV_GO_CHECKED, Date.now());
+  return live;
+}
+
+function arraysEqual(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
-// Build leaderboard from Go model IDs (sequential, optional cadence)
+// Assemble leaderboard from KV
 // ---------------------------------------------------------------------------
 
 type Row = {
@@ -264,58 +327,46 @@ type Row = {
   matched: boolean;
 };
 
-type BuildResult = {
+type BuildState = {
   rows: Row[];
   benchmarks: typeof BENCHMARKS;
   updatedAt: string;
-  notes: string[];
+  remaining: number;
+  retryAfterMs: number | null;
 };
 
-async function buildData(cadenceMs = 0): Promise<BuildResult> {
-  const notes: string[] = [];
-
-  // 1) Go model list.
-  const ocIds = await getGoModelIds();
-
-  // 2) Go utilization limits (KV-cached, 7-day TTL).
+async function assembleBuild(goIds: string[]): Promise<BuildState> {
+  // Load any Go limits we already have; never fetch them in the hot path.
   let goLimits: Record<
     string,
     { reqPer5h: number; reqPerWeek: number; reqPerMonth: number }
   > = {};
-  try {
-    goLimits = await fetchGoLimits();
-  } catch (e) {
-    notes.push(`Go limits fetch failed: ${(e as Error).message}`);
+  const limitsEntry = await kv.get<GoLimits>(["go-limits"]);
+  if (limitsEntry.value) goLimits = limitsEntry.value.limits;
+
+  const entries = new Map<string, CachedModel>();
+  const it = kv.list<CachedModel>({ prefix: ["model"] });
+  for await (const entry of it) {
+    const id = String(entry.key[1]);
+    if (entry.value) entries.set(id, entry.value);
   }
 
-  // 3) Per-model benchmarks — one request per model, sequential.
-  const cadenceLabel = cadenceMs ? ` (${cadenceMs / 1000}s cadence)` : "";
-  console.log(
-    `[build] fetching benchmarks for ${ocIds.length} models${cadenceLabel}...`,
-  );
-
-  const results: (ModelResult | null)[] = [];
-  for (const id of ocIds) {
-    if (cadenceMs > 0) await sleep(cadenceMs);
-    results.push(await fetchModelBenchmarks(id));
-  }
-
-  // 4) Assemble rows.
   const rows: Row[] = [];
   let matchedCount = 0;
 
-  for (let i = 0; i < ocIds.length; i++) {
-    const id = ocIds[i];
+  for (const id of goIds) {
     const limits = goLimits[id] ?? null;
-    const r = results[i];
+    const cached = entries.get(id);
 
     const benchmarks: Record<string, number | null> = {};
     const percentiles: Record<string, number | null> = {};
     let matchedAny = false;
-    if (r) {
+
+    if (cached && "data" in cached) {
+      const data = cached.data;
       for (const b of BENCHMARKS) {
-        benchmarks[b.slug] = r.value[b.slug] ?? null;
-        percentiles[b.slug] = r.percentile[b.slug] ?? null;
+        benchmarks[b.slug] = data.value[b.slug] ?? null;
+        percentiles[b.slug] = data.percentile[b.slug] ?? null;
         if (benchmarks[b.slug] != null) matchedAny = true;
       }
     } else {
@@ -343,64 +394,94 @@ async function buildData(cadenceMs = 0): Promise<BuildResult> {
     });
   }
 
+  const remaining = await countPending(goIds);
+
   console.log(
-    `[build] ${matchedCount}/${ocIds.length} models have at least one benchmark`,
+    `[tick] assemble: ${matchedCount}/${goIds.length} matched, ${remaining} pending`,
   );
-  for (const b of BENCHMARKS) {
-    const count = rows.filter((r) => r.benchmarks[b.slug] != null).length;
-    console.log(`[build] ${b.slug}: ${count} models with data`);
-  }
-  const unmatched = rows.length - matchedCount;
-  if (unmatched > 0) {
-    notes.push(
-      `${unmatched} model(s) have no public benchmark yet (very new releases) and are listed without a score.`,
-    );
-  }
 
   return {
     rows,
     benchmarks: BENCHMARKS,
     updatedAt: new Date().toISOString(),
-    notes,
+    remaining,
+    retryAfterMs: null,
   };
 }
 
 // ---------------------------------------------------------------------------
-// Background refresh — fire-and-forget, slow cadence
+// Tick: fetch exactly one missing model, persist it, report progress
 // ---------------------------------------------------------------------------
 
-async function startBackgroundRefresh(
+async function tick(
   goIds: string[],
-  label = "auto",
-): Promise<void> {
-  const lock = await kv.get<boolean>(KV_REFRESH_LOCK);
-  if (lock.value) {
-    console.log(`[refresh] ${label}: already running, skipping`);
-    return;
-  }
-  await kv.set(KV_REFRESH_LOCK, true);
+  deadlineMs: number,
+): Promise<{
+  fetched: boolean;
+  id: string | null;
+  value?: Record<string, number>;
+  percentile?: Record<string, number>;
+  remaining: number;
+  retryAfterMs: number | null;
+}> {
+  for (const id of goIds) {
+    if (Date.now() > deadlineMs) break;
 
-  // Fire-and-forget: the handler returns immediately; this Promise continues
-  // running in the event loop. On Deno Deploy the isolate stays alive long
-  // enough for the slow build to finish (35 models × 2 s ≈ 70 s).
-  (async () => {
-    try {
-      console.log(`[refresh] ${label}: starting for ${goIds.length} models`);
-      const data = await buildData(CADENCE_MS);
-      await kv.set(KV_LEADERBOARD, data);
-      // Store model list AFTER leaderboard so interrupted builds re-trigger.
-      await kv.set(KV_GO_IDS, goIds);
-      console.log(
-        `[refresh] ${label}: complete — ${
-          data.rows.filter((r) => r.matched).length
-        } models with benchmarks`,
-      );
-    } catch (e) {
-      console.log(`[refresh] ${label}: failed — ${(e as Error).message}`);
-    } finally {
-      await kv.delete(KV_REFRESH_LOCK);
+    const cached = await kv.get<CachedModel>(kvModelKey(id));
+    // Skip models that already have benchmark data or a live tombstone.
+    if (cached.value && "data" in cached.value) continue;
+    if (cached.value && "empty" in cached.value) {
+      const t = cached.value.fetchedAt;
+      if (Date.now() - t < TOMBSTONE_TTL_MS) continue;
     }
-  })();
+
+    const r = await fetchModelOnce(id);
+    if (r.kind === "ok") {
+      await kv.set(kvModelKey(id), {
+        data: r.data,
+        fetchedAt: Date.now(),
+      });
+      console.log(`[tick] fetched ${id}`);
+      return {
+        fetched: true,
+        id,
+        value: r.data.value,
+        percentile: r.data.percentile,
+        remaining: await countPending(goIds),
+        retryAfterMs: null,
+      };
+    }
+    if (r.kind === "empty") {
+      await kv.set(kvModelKey(id), { empty: true, fetchedAt: Date.now() }, {
+        expireIn: TOMBSTONE_TTL_MS,
+      });
+      console.log(`[tick] recorded empty for ${id}`);
+      return { fetched: true, id, remaining: await countPending(goIds), retryAfterMs: null };
+    }
+    if (r.kind === "rateLimited") {
+      return { fetched: false, id: null, remaining: await countPending(goIds), retryAfterMs: r.retryAfterMs };
+    }
+    // "error": transient failure — burn the rest of the tick budget waiting
+    // so the client doesn't hammer the API again immediately.
+    const waitMs = Math.max(0, deadlineMs - Date.now());
+    if (waitMs > 0) await sleep(waitMs);
+    return { fetched: false, id: null, remaining: await countPending(goIds), retryAfterMs: null };
+  }
+  return { fetched: false, id: null, remaining: await countPending(goIds), retryAfterMs: null };
+}
+
+async function countPending(goIds: string[]): Promise<number> {
+  let remaining = 0;
+  for (const id of goIds) {
+    const cached = await kv.get<CachedModel>(kvModelKey(id));
+    if (!cached.value) {
+      remaining++;
+      continue;
+    }
+    if ("data" in cached.value) continue; // resolved
+    if (Date.now() - cached.value.fetchedAt >= TOMBSTONE_TTL_MS) remaining++;
+  }
+  return remaining;
 }
 
 // ---------------------------------------------------------------------------
@@ -422,31 +503,29 @@ function escapeHtml(s: string): string {
   );
 }
 
-const htmlTemplate = await Deno.readTextFile(
-  new URL("./index.html", import.meta.url),
-);
+// Read fresh every request so template edits apply under watch mode without a
+// restart (index.html isn't an import, so --watch doesn't track it).
+const readHtml = () => Deno.readTextFile(new URL("./index.html", import.meta.url));
 
-function renderHtml(data: BuildResult): string {
-  const { rows, benchmarks, updatedAt, notes } = data;
+async function renderHtml(data: BuildState): Promise<string> {
+  const { rows, benchmarks } = data;
   const rowJson = JSON.stringify(rows).replace(/</g, "\\u003c");
   const benchJson = JSON.stringify(benchmarks).replace(/</g, "\\u003c");
-  const noteHtml = notes.length
-    ? `<ul class="notes">${
-      notes.map((n) => `<li>${escapeHtml(n)}</li>`).join("")
-    }</ul>`
-    : "";
-  return htmlTemplate!
-    .replace("__updatedAt__", escapeHtml(updatedAt))
-    .replace("__noteHtml__", noteHtml)
+  const buildJson = JSON.stringify(
+    { remaining: data.remaining, retryAfterMs: data.retryAfterMs },
+  ).replace(/</g, "\\u003c");
+  return (await readHtml())
+    .replace("__updatedAt__", escapeHtml(data.updatedAt))
     .replace("__rowJson__", rowJson)
-    .replace("__benchJson__", benchJson);
+    .replace("__benchJson__", benchJson)
+    .replace("__buildJson__", buildJson);
 }
 
-function serveHtml(data: BuildResult): Response {
-  return new Response(renderHtml(data), {
+async function serveHtml(data: BuildState): Promise<Response> {
+  return new Response(await renderHtml(data), {
     headers: {
       "content-type": "text/html; charset=utf-8",
-      "cache-control": "public, max-age=300",
+      "cache-control": "public, max-age=60",
     },
   });
 }
@@ -454,6 +533,12 @@ function serveHtml(data: BuildResult): Response {
 // ---------------------------------------------------------------------------
 // Request handler
 // ---------------------------------------------------------------------------
+
+const json = (data: unknown, status = 200): Response =>
+  new Response(JSON.stringify(data), {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8" },
+  });
 
 async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
@@ -469,9 +554,7 @@ async function handler(req: Request): Promise<Response> {
     });
   }
   if (url.pathname === "/index.css") {
-    const css = await Deno.readTextFile(
-      new URL("./index.css", import.meta.url),
-    );
+    const css = await Deno.readTextFile(new URL("./index.css", import.meta.url));
     return new Response(css, {
       headers: {
         "content-type": "text/css; charset=utf-8",
@@ -483,42 +566,41 @@ async function handler(req: Request): Promise<Response> {
     return new Response("Not Found", { status: 404 });
   }
 
-  const forceRefresh = url.searchParams.get("refresh") === "1";
-
-  // Always try to serve cached data immediately.
-  const cached = await kv.get<BuildResult>(KV_LEADERBOARD);
-
-  if (cached.value) {
-    // If refresh requested, fire off a background rebuild (non-blocking).
-    if (forceRefresh) {
-      getGoModelIds().then((ids) => startBackgroundRefresh(ids, "manual"))
-        .catch(() => {});
-    } else {
-      // Check in background whether the Go model list has changed.
-      getGoModelIds()
-        .then(async (goIds) => {
-          const changed = await hasGoModelsChanged(goIds);
-          if (changed) {
-            console.log(
-              "[auto] Go model list changed, refreshing in background",
-            );
-            await startBackgroundRefresh(goIds, "auto");
-          }
-        })
-        .catch(() => {});
-    }
-    return serveHtml(cached.value);
-  }
-
-  // Cold start: no cached data. Build synchronously with slow cadence so
-  // we don't hit rate limits on the very first page load.
   try {
-    console.log("[cold] no cached data, building synchronously...");
-    const goIds = await getGoModelIds();
-    const data = await buildData(CADENCE_MS);
-    await kv.set(KV_LEADERBOARD, data);
-    await kv.set(KV_GO_IDS, goIds);
-    return serveHtml(data);
+    const t0 = performance.now();
+    // Re-fetch the Go list only when due; fetch limits if never cached.
+    const goIds = await ensureGoIds();
+    const t1 = performance.now();
+    console.log(`[perf] ensureGoIds ${(t1 - t0).toFixed(1)}ms`);
+    if (await kv.get(["go-limits"]).then((e) => !e.value)) {
+      try {
+        await fetchGoLimits();
+      } catch (e) {
+        console.log(`[build] limits fetch failed: ${(e as Error).message}`);
+      }
+    }
+    const t2 = performance.now();
+    console.log(`[perf] limits check ${(t2 - t1).toFixed(1)}ms`);
+
+    // Tick request: fetch at most one missing model, bounded in time.
+    if (url.searchParams.get("tick") === "1") {
+      const result = await tick(goIds, Date.now() + TICK_BUDGET_MS);
+      return json(result);
+    }
+
+    // Hard refresh: wipe model cache so ticks repopulate (and Go limits too).
+    if (url.searchParams.get("refresh") === "1") {
+      console.log("[build] manual refresh requested, clearing model cache");
+      const it = kv.list({ prefix: ["model"] });
+      const keys: Deno.KvKey[] = [];
+      for await (const entry of it) keys.push([...entry.key]);
+      for (const key of keys) await kv.delete(key);
+      await kv.delete(KV_GO_CHECKED);
+    }
+
+    const state = await assembleBuild(goIds);
+    console.log(`[perf] assembleBuild ${(performance.now() - t2).toFixed(1)}ms`);
+    return await serveHtml(state);
   } catch (e) {
     const msg = (e as Error).message;
     return new Response(

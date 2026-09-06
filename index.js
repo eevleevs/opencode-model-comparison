@@ -71,7 +71,13 @@ function valueIndex(rows, aggScores) {
   return m;
 }
 
-let sortKey = "val", sortDir = -1;
+let sortKey = localStorage.getItem("oc-sort-key") || "val";
+let sortDir = Number(localStorage.getItem("oc-sort-dir")) || -1;
+
+function persistSort() {
+  localStorage.setItem("oc-sort-key", sortKey);
+  localStorage.setItem("oc-sort-dir", String(sortDir));
+}
 
 function render() {
   const aggScores = aggBenchIndex();
@@ -177,8 +183,76 @@ document.querySelectorAll("th").forEach((th) => {
       sortKey = k;
       sortDir = -1;
     }
+    persistSort();
     render();
   });
 });
+
+// --- Incremental build: tick-poll until the leaderboard is fully populated.
+// The server fetches at most one CloudPrice model per /?tick=1 request, so the
+// client simply polls until remaining hits 0, waiting out 429 retry-after.
+const build = window.BUILD || { remaining: 0, retryAfterMs: null };
+const buildStatus = document.getElementById("build-status");
+let stopped = false;
+
+function setBuildStatus(text) {
+  if (buildStatus) buildStatus.textContent = text;
+}
+
+function scheduleTick() {
+  if (stopped || build.remaining <= 0) return;
+  const delay = build.retryAfterMs
+    ? Math.max(10000, build.retryAfterMs + 100)
+    : Math.max(2500, 2500 + Math.random() * 500);
+  setTimeout(doTick, delay);
+}
+
+async function doTick() {
+  if (stopped || build.remaining <= 0) return;
+  setBuildStatus(
+    "Building leaderboard — fetching benchmark data for " + build.remaining +
+    " more model(s)…",
+  );
+  let res;
+  try {
+    res = await fetch("/?tick=1");
+  } catch {
+    scheduleTick();
+    return;
+  }
+  if (!res.ok) {
+    scheduleTick();
+    return;
+  }
+  let r;
+  try {
+    r = await res.json();
+  } catch {
+    scheduleTick();
+    return;
+  }
+  build.remaining = Number.isInteger(r.remaining) ? r.remaining : build.remaining - 1;
+  build.retryAfterMs = Number.isFinite(r.retryAfterMs) ? r.retryAfterMs : null;
+  if (r.fetched && r.id && r.value) {
+    const row = window.ROWS.find((x) => x.id === r.id);
+    if (row) {
+      for (const b of window.BENCH) {
+        row.benchmarks[b.slug] = r.value[b.slug] ?? null;
+        row.percentiles[b.slug] = r.percentile?.[b.slug] ?? null;
+      }
+      row.matched = window.BENCH.some((b) => row.benchmarks[b.slug] != null);
+      render();
+    }
+  }
+  if (build.remaining <= 0) {
+    stopped = true;
+    setBuildStatus("");
+    location.href = "/";
+    return;
+  }
+  scheduleTick();
+}
+
+scheduleTick();
 
 render();

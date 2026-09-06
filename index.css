@@ -23,12 +23,6 @@ h1 {
   color: #8b949e;
   font-size: 12px;
 }
-.notes {
-  color: #d29922;
-  font-size: 12px;
-  padding: 0 16px;
-  list-style-position: inside;
-}
 .wrap {
   padding: 8px 20px 40px;
   overflow-x: auto;
