@@ -35,9 +35,8 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // covers even pathological 429 retry-after values without sleeping forever.
 const TICK_BUDGET_MS = 15000;
 
-// 404/409/no-source results are persisted as tombstones so ticks don't retry
-// them forever. They expire, so models that later gain benchmarks refetch.
-const TOMBSTONE_TTL_MS = 24 * 60 * 60 * 1000;
+// Data never expires, but auto-refresh if older than this (1 week).
+const STALE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 // Re-check the Go model list at most this often.
 const GO_LIST_CHECK_MS = 5 * 60 * 1000;
@@ -428,11 +427,10 @@ async function tick(
     if (Date.now() > deadlineMs) break;
 
     const cached = await kv.get<CachedModel>(kvModelKey(id));
-    // Skip models that already have benchmark data or a live tombstone.
-    if (cached.value && "data" in cached.value) continue;
-    if (cached.value && "empty" in cached.value) {
-      const t = cached.value.fetchedAt;
-      if (Date.now() - t < TOMBSTONE_TTL_MS) continue;
+    // Skip models that already have fresh benchmark data or a fresh tombstone.
+    if (cached.value) {
+      const age = Date.now() - cached.value.fetchedAt;
+      if (age < STALE_TTL_MS) continue;
     }
 
     const r = await fetchModelOnce(id);
@@ -452,9 +450,7 @@ async function tick(
       };
     }
     if (r.kind === "empty") {
-      await kv.set(kvModelKey(id), { empty: true, fetchedAt: Date.now() }, {
-        expireIn: TOMBSTONE_TTL_MS,
-      });
+      await kv.set(kvModelKey(id), { empty: true, fetchedAt: Date.now() });
       console.log(`[tick] recorded empty for ${id}`);
       return { fetched: true, id, remaining: await countPending(goIds), retryAfterMs: null };
     }
@@ -478,8 +474,11 @@ async function countPending(goIds: string[]): Promise<number> {
       remaining++;
       continue;
     }
-    if ("data" in cached.value) continue; // resolved
-    if (Date.now() - cached.value.fetchedAt >= TOMBSTONE_TTL_MS) remaining++;
+    const age = Date.now() - cached.value.fetchedAt;
+    if (age >= STALE_TTL_MS) {
+      remaining++;
+      continue;
+    }
   }
   return remaining;
 }
