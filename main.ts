@@ -288,24 +288,31 @@ async function ensureGoIds(): Promise<string[]> {
   const live = await getGoModelIds();
   const cached = await kv.get<string[]>(KV_GO_IDS);
 
-  if (!cached.value || !arraysEqual(live, cached.value)) {
+  if (!cached.value || !setsEqual(live, cached.value)) {
+    const oldSet = new Set(cached.value ?? []);
+    const liveSet = new Set(live);
+    const added = live.filter((id) => !oldSet.has(id));
+    const removed = (cached.value ?? []).filter((id) => !liveSet.has(id));
     console.log(
-      `[build] Go model list changed (${cached.value?.length ?? 0} -> ${live.length}), clearing model cache`,
+      `[build] Go model list changed: +${added.length} added, -${removed.length} removed`,
     );
-    const it = kv.list({ prefix: ["model"] });
-    const toDelete: Deno.KvKey[] = [];
-    for await (const entry of it) toDelete.push([...entry.key]);
-    for (const key of toDelete) await kv.delete(key);
+    // Only delete cache entries for models that are no longer in the Go list.
+    for (const id of removed) await kv.delete(kvModelKey(id));
+    if (added.length) {
+      // Reset checkedAt so ticks immediately start fetching the new models.
+      await kv.delete(KV_GO_CHECKED);
+    }
     await kv.set(KV_GO_IDS, live);
   }
   await kv.set(KV_GO_CHECKED, Date.now());
   return live;
 }
 
-function arraysEqual(a: string[], b: string[]): boolean {
+function setsEqual(a: string[], b: string[]): boolean {
   if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    if (a[i] !== b[i]) return false;
+  const set = new Set(a);
+  for (const id of b) {
+    if (!set.has(id)) return false;
   }
   return true;
 }
@@ -587,13 +594,16 @@ async function handler(req: Request): Promise<Response> {
       return json(result);
     }
 
-    // Hard refresh: wipe model cache so ticks repopulate (and Go limits too).
+    // Hard refresh: re-fetch the Go model list, drop only removed models,
+    // and reset the checkedAt so ticks re-fetch stale data for the rest.
     if (url.searchParams.get("refresh") === "1") {
-      console.log("[build] manual refresh requested, clearing model cache");
-      const it = kv.list({ prefix: ["model"] });
-      const keys: Deno.KvKey[] = [];
-      for await (const entry of it) keys.push([...entry.key]);
-      for (const key of keys) await kv.delete(key);
+      console.log("[build] manual refresh requested");
+      const live = await getGoModelIds();
+      const cached = await kv.get<string[]>(KV_GO_IDS);
+      const liveSet = new Set(live);
+      const removed = (cached.value ?? []).filter((id) => !liveSet.has(id));
+      for (const id of removed) await kv.delete(kvModelKey(id));
+      await kv.set(KV_GO_IDS, live);
       await kv.delete(KV_GO_CHECKED);
     }
 
