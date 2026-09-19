@@ -622,5 +622,6 @@ async function handler(req: Request): Promise<Response> {
   }
 }
 
-Deno.serve(handler);
+const PORT = Number(Deno.env.get("PORT") ?? "8001") || 8001;
+Deno.serve({ port: PORT }, handler);
 export default handler;
