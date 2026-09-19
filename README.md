@@ -35,6 +35,7 @@ deno task start      # single run
 Manual checks:
 
 ```sh
+deno task test     # unit tests (pure.ts helpers, offline)
 deno check --quiet main.ts
 deno lint main.ts index.js
 ```
@@ -42,4 +43,5 @@ deno lint main.ts index.js
 ## Repo layout
 
 - `main.ts` — Deno KV store, one-model tick endpoint, HTML handler
+- `pure.ts` / `pure_test.ts` — side-effect-free helpers + unit tests
 - `index.html` / `index.js` / `index.css` — client, including the tick-polling + live-update loop

@@ -1,15 +1,18 @@
 // OpenCode Go Model Leaderboard
 // Fetches the latest models available on OpenCode Go, their utilization limits
-// (from the Go docs), and coding benchmarks (from CloudPrice), then ranks them
-// by a "value" score = benchmark performance × requests per month.
+// (from the Go docs), and coding benchmarks (primary: Artificial Analysis v2
+// bulk; fallback: CloudPrice per-model), then ranks them by a "value" score
+// = benchmark performance × requests per month.
 //
 // Deno Deploy is serverless: isolates idle-shutdown and requests that run too
-// long are killed (502). So NO request ever does more than one CloudPrice call.
-// Benchmark results are persisted per-model in KV as soon as each one is
-// fetched; the page always renders whatever is in KV immediately. A client
-// polls GET /?tick=1 (one model fetch per tick) until the leaderboard is full.
+// long are killed (502). So NO request ever does more than one CloudPrice call
+// or one AA bulk call. AA-covered models resolve via the daily bulk cache;
+// the client polls GET /?tick=1 (one CloudPrice fetch per tick) only for
+// AA-misses until those resolve. The page always renders whatever is in KV
+// immediately (stale-while-revalidate).
 //
-// Deploy: `deno run --allow-net --allow-read --unstable-kv main.ts`
+// Deploy: `deno run --allow-net --allow-read --allow-env --unstable-kv main.ts`
+// Local: copy .env.example to .env for AA_API_KEY (see README).
 
 const OC_GO_MODELS_URL = "https://opencode.ai/zen/go/v1/models";
 const GO_DOCS_URL =
@@ -157,6 +160,13 @@ type GoLimits = {
 
 const GO_LIMITS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
+import {
+  aaRankPercentile,
+  cleanName,
+  cleanReqCount,
+  rankPercentile,
+} from "./pure.ts";
+
 async function fetchGoLimits(
   forceRefresh = false,
 ): Promise<GoLimits["limits"]> {
@@ -181,20 +191,30 @@ async function fetchGoLimits(
   }
   const displayNameToId = new Map<string, string>();
   for (const row of endpointsTable.rows) {
-    const displayName = row[0];
-    const modelId = row[1];
+    const displayName = cleanName(row[0]);
+    const modelId = row[1]?.trim();
     if (displayName && modelId) displayNameToId.set(displayName, modelId);
   }
   const limits: GoLimits["limits"] = {};
+  const skipped: string[] = [];
   for (const row of requestsTable.rows) {
-    const displayName = row[0];
-    const reqPer5h = parseInt(row[1]?.replace(/,/g, ""), 10);
-    const reqPerWeek = parseInt(row[2]?.replace(/,/g, ""), 10);
-    const reqPerMonth = parseInt(row[3]?.replace(/,/g, ""), 10);
+    const displayName = cleanName(row[0]);
+    const reqPer5h = cleanReqCount(row[1]);
+    const reqPerWeek = cleanReqCount(row[2]);
+    const reqPerMonth = cleanReqCount(row[3]);
     const id = displayNameToId.get(displayName);
-    if (id && !isNaN(reqPer5h) && !isNaN(reqPerWeek) && !isNaN(reqPerMonth)) {
-      limits[id] = { reqPer5h, reqPerWeek, reqPerMonth };
+    if (!id) {
+      skipped.push(`${displayName} (no endpoint id)`);
+      continue;
     }
+    if (isNaN(reqPer5h) || isNaN(reqPerWeek) || isNaN(reqPerMonth)) {
+      skipped.push(`${displayName} (unparsed counts)`);
+      continue;
+    }
+    limits[id] = { reqPer5h, reqPerWeek, reqPerMonth };
+  }
+  if (skipped.length) {
+    console.log(`[build] limits skipped rows: ${skipped.join("; ")}`);
   }
   console.log(
     `[build] parsed ${Object.keys(limits).length} model limits from Go docs`,
@@ -220,13 +240,23 @@ function kvModelKey(id: string): string[] {
 // Per-model benchmark fetch
 // ---------------------------------------------------------------------------
 
-type CpiScore = { metric: string; value?: number; percentile?: number };
+type CpiScore = {
+  metric: string;
+  value?: number;
+  percentile?: number;
+  rank?: number;
+  total?: number;
+};
 type CpiSource = { scores?: CpiScore[] };
 type CpiPayload = { data?: { sources?: CpiSource[] } };
 
 type ModelData = {
   value: Record<string, number>;
   percentile: Record<string, number>;
+  // Rank/total per metric for uniform rank-percentile recomputation.
+  // Older KV entries lack these and fall back to stored percentile.
+  rank?: Record<string, number>;
+  total?: Record<string, number>;
 };
 
 type EmptyReason =
@@ -270,12 +300,16 @@ async function fetchModelOnce(
     }
     const value: Record<string, number> = {};
     const percentile: Record<string, number> = {};
+    const rank: Record<string, number> = {};
+    const total: Record<string, number> = {};
     for (const src of srcs) {
       for (const s of src.scores ?? []) {
         if (typeof s.value === "number") value[s.metric] = s.value;
         if (typeof s.percentile === "number") {
           percentile[s.metric] = s.percentile;
         }
+        if (typeof s.rank === "number") rank[s.metric] = s.rank;
+        if (typeof s.total === "number") total[s.metric] = s.total;
       }
     }
     const wanted = Object.keys(value).filter((k) => WANTED_METRICS.has(k));
@@ -289,7 +323,7 @@ async function fetchModelOnce(
         sourcesCount: srcs.length,
       };
     }
-    return { kind: "ok", data: { value, percentile } };
+    return { kind: "ok", data: { value, percentile, rank, total } };
   } catch (e) {
     if (e instanceof RateLimitedError) {
       console.log(`[tick] 429 on ${id}, retry in ${e.retryAfterMs}ms`);
@@ -319,12 +353,15 @@ const AA_BULK_TTL_MS = 24 * 60 * 60 * 1000;
 // per-Go-model subset, one small key per model.
 const KV_AA_BULK = ["aa", "bulk"];
 const KV_AA_MODEL_PREFIX = ["aa", "model"];
+const KV_AA_DIST_PREFIX = ["aa", "dist"];
 const KV_AA_FETCHED = ["aa", "fetchedAt"];
 
 const kvAaModelKey = (id: string): string[] => [
   ...KV_AA_MODEL_PREFIX,
   normId(id),
 ];
+
+const kvAaDistKey = (slug: string): string[] => [...KV_AA_DIST_PREFIX, slug];
 
 type AaBulkModel = {
   slug?: string;
@@ -440,6 +477,21 @@ async function loadAaShard(): Promise<AaBulkModel[] | null> {
   return models.length ? models : null;
 }
 
+// Full-catalog sorted value distributions per benchmark slug, for rank
+// percentiles (CloudPrice percentiles lag; AA free tier has none).
+async function loadAaDists(): Promise<Record<string, number[]> | null> {
+  const fetched = await kv.get<number>(KV_AA_FETCHED);
+  if (!fetched.value || Date.now() - fetched.value >= AA_BULK_TTL_MS) {
+    return null;
+  }
+  const dists: Record<string, number[]> = {};
+  for (const b of BENCHMARKS) {
+    const entry = await kv.get<number[]>(kvAaDistKey(b.slug));
+    if (entry.value?.length) dists[b.slug] = entry.value;
+  }
+  return Object.keys(dists).length ? dists : null;
+}
+
 async function fetchAaBulk(
   force = false,
   goIds: string[] = [],
@@ -459,6 +511,23 @@ async function fetchAaBulk(
   const models = d?.data ?? [];
   if (!models.length) throw new Error("AA bulk returned 0 models");
   const fullIdx = buildAaIndex(models);
+  // Persist per-benchmark catalog distributions for rank percentiles.
+  for (const b of BENCHMARKS) {
+    const keys = AA_TO_BENCH[b.slug] ?? [b.slug];
+    const vals: number[] = [];
+    for (const m of models) {
+      const evals = m.evaluations ?? {};
+      for (const key of keys) {
+        const v = evals[key];
+        if (typeof v === "number") {
+          vals.push(v);
+          break;
+        }
+      }
+    }
+    vals.sort((x, y) => x - y);
+    if (vals.length) await kv.set(kvAaDistKey(b.slug), vals);
+  }
   // Persist only Go-matched compact models (tiny keys, no 64KiB issue).
   // Drop the legacy single-key cache if present.
   await kv.delete(KV_AA_BULK);
@@ -479,27 +548,56 @@ async function fetchAaBulk(
   }
   await kv.set(KV_AA_FETCHED, Date.now());
   console.log(
-    `[build] AA bulk: ${models.length} total, ${matched.length}/${goIds.length} Go matched, ${stored} shard keys stored`,
+    `[build] AA bulk: ${models.length} total, ${matched.length}/${goIds.length} Go matched, ${stored} shard keys + dists stored`,
   );
   return matched;
+}
+
+type AaData = {
+  idx: Map<string, AaBulkModel>;
+  dists: Record<string, number[]> | null;
+};
+
+// Models AA covers (any wanted value) — these skip CloudPrice ticks.
+function aaCoveredIds(idx: Map<string, AaBulkModel>, goIds: string[]): Set<string> {
+  const covered = new Set<string>();
+  for (const id of goIds) {
+    const hit = lookupAa(idx, id);
+    if (hit && Object.keys(aaValuesFor(hit).value).length > 0) {
+      covered.add(id);
+    }
+  }
+  return covered;
+}
+
+async function getAaData(
+  goIds: string[] = [],
+): Promise<AaData | null> {
+  const apiKey = Deno.env.get("AA_API_KEY") ?? "";
+  if (!apiKey) return null;
+  try {
+    const cached = await loadAaShard();
+    if (cached) {
+      return { idx: buildAaIndex(cached), dists: await loadAaDists() };
+    }
+    const models = await fetchAaBulk(false, goIds);
+    if (!models) return null;
+    return { idx: buildAaIndex(models), dists: await loadAaDists() };
+  } catch (e) {
+    console.log(`[build] AA bulk failed, fallback to CloudPrice: ${(e as Error).message}`);
+    const cached = await loadAaShard();
+    if (cached) {
+      return { idx: buildAaIndex(cached), dists: await loadAaDists() };
+    }
+    return null;
+  }
 }
 
 async function getAaIndex(
   goIds: string[] = [],
 ): Promise<Map<string, AaBulkModel> | null> {
-  const apiKey = Deno.env.get("AA_API_KEY") ?? "";
-  if (!apiKey) return null;
-  try {
-    const cached = await loadAaShard();
-    if (cached) return buildAaIndex(cached);
-    const models = await fetchAaBulk(false, goIds);
-    return models ? buildAaIndex(models) : null;
-  } catch (e) {
-    console.log(`[build] AA bulk failed, fallback to CloudPrice: ${(e as Error).message}`);
-    const cached = await loadAaShard();
-    if (cached) return buildAaIndex(cached);
-    return null;
-  }
+  const data = await getAaData(goIds);
+  return data?.idx ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -592,16 +690,25 @@ async function assembleBuild(goIds: string[]): Promise<BuildState> {
     if (entry.value) entries.set(id, entry.value);
   }
 
-  // AA bulk is primary for values; CloudPrice KV keeps percentiles + fallback.
-  const aaIdx = await getAaIndex(goIds);
+  // AA bulk is primary for values AND rank percentiles; CloudPrice KV is
+  // fallback for AA-misses (values + percentiles) and percentiles where
+  // catalog distributions are unavailable.
+  const aaData = await getAaData(goIds);
+  const aaIdx = aaData?.idx ?? null;
+  const aaDists = aaData?.dists ?? null;
 
   const rows: Row[] = [];
   let matchedCount = 0;
   let aaFilled = 0;
+  let aaPctFilled = 0;
+  let limitsCount = 0;
   const emptyReasons: Record<string, number> = {};
+  const noLimits: string[] = [];
 
   for (const id of goIds) {
     const limits = goLimits[id] ?? null;
+    if (limits) limitsCount++;
+    else noLimits.push(id);
     const cached = entries.get(id);
 
     const benchmarks: Record<string, number | null> = {};
@@ -612,7 +719,17 @@ async function assembleBuild(goIds: string[]): Promise<BuildState> {
       const data = cached.data;
       for (const b of BENCHMARKS) {
         benchmarks[b.slug] = data.value[b.slug] ?? null;
-        percentiles[b.slug] = data.percentile[b.slug] ?? null;
+        // Uniform rank logic: recompute from rank/total (same family as
+        // aaRankPercentile). Old KV entries lack rank/total and fall back
+        // to the stored upstream percentile.
+        const r = data.rank?.[b.slug];
+        const t = data.total?.[b.slug];
+        const recomputed = r != null && t != null
+          ? rankPercentile(r, t)
+          : NaN;
+        percentiles[b.slug] = !isNaN(recomputed)
+          ? recomputed
+          : data.percentile[b.slug] ?? null;
         if (benchmarks[b.slug] != null) matchedAny = true;
       }
     } else {
@@ -626,20 +743,28 @@ async function assembleBuild(goIds: string[]): Promise<BuildState> {
       }
     }
 
-    // Fill gaps from AA bulk (values only; percentiles stay from CloudPrice).
+    // AA wins where present (fresher than the CloudPrice snapshot):
+    // overwrite values and derive rank percentiles from catalog dists.
     if (aaIdx) {
       const hit = lookupAa(aaIdx, id);
       if (hit) {
         const { value } = aaValuesFor(hit);
         let filledThis = false;
+        let pctThis = false;
         for (const b of BENCHMARKS) {
-          if (benchmarks[b.slug] == null && typeof value[b.slug] === "number") {
+          if (typeof value[b.slug] === "number") {
+            if (benchmarks[b.slug] == null) filledThis = true;
             benchmarks[b.slug] = value[b.slug];
             matchedAny = true;
-            filledThis = true;
+            const dist = aaDists?.[b.slug];
+            if (dist?.length) {
+              percentiles[b.slug] = aaRankPercentile(dist, value[b.slug]);
+              pctThis = true;
+            }
           }
         }
         if (filledThis) aaFilled++;
+        if (pctThis) aaPctFilled++;
       }
     }
 
@@ -664,7 +789,7 @@ async function assembleBuild(goIds: string[]): Promise<BuildState> {
   const remaining = await countPending(goIds);
 
   console.log(
-    `[tick] assemble: ${matchedCount}/${goIds.length} matched, ${remaining} pending, aaFilled=${aaFilled}, emptyReasons=${JSON.stringify(emptyReasons)}, aa=${aaIdx ? "on" : "off"}`,
+    `[tick] assemble: ${matchedCount}/${goIds.length} matched, ${remaining} pending, aaFilled=${aaFilled}, aaPct=${aaPctFilled}, emptyReasons=${JSON.stringify(emptyReasons)}, aa=${aaIdx ? "on" : "off"}, limits=${limitsCount}/${goIds.length} noLimits=[${noLimits.join(",")}]`,
   );
 
   return {
@@ -679,6 +804,9 @@ async function assembleBuild(goIds: string[]): Promise<BuildState> {
 // ---------------------------------------------------------------------------
 // Tick: fetch exactly one missing model, persist it, report progress
 // ---------------------------------------------------------------------------
+// CloudPrice ticks cover only AA-misses: AA is primary (values + rank
+// percentiles), so re-ticking AA-covered models would overwrite fresher
+// data with the lagging snapshot. Without an AA key, all models tick.
 
 async function tick(
   goIds: string[],
@@ -692,8 +820,13 @@ async function tick(
   retryAfterMs: number | null;
 }> {
   const refreshAt = (await kv.get<number>(KV_GO_REFRESH)).value ?? 0;
+  const aaIdx = await getAaIndex(goIds);
+  const covered = aaIdx ? aaCoveredIds(aaIdx, goIds) : new Set<string>();
   for (const id of goIds) {
     if (Date.now() > deadlineMs) break;
+
+    // AA-covered models never need CloudPrice (values + percentiles from AA).
+    if (covered.has(id)) continue;
 
     const cached = await kv.get<CachedModel>(kvModelKey(id));
     // Skip fresh entries, unless a manual refresh asked for revalidation.
@@ -710,11 +843,25 @@ async function tick(
         fetchedAt: Date.now(),
       });
       console.log(`[tick] fetched ${id}`);
+      // Recompute percentiles with the uniform rank logic so live-patched
+      // rows match what assembleBuild() renders.
+      const pct: Record<string, number> = {};
+      for (const k of Object.keys(r.data.value)) {
+        const rk = r.data.rank?.[k];
+        const tot = r.data.total?.[k];
+        const recomputed = rk != null && tot != null
+          ? rankPercentile(rk, tot)
+          : NaN;
+        const v = !isNaN(recomputed)
+          ? recomputed
+          : r.data.percentile[k];
+        if (typeof v === "number") pct[k] = v;
+      }
       return {
         fetched: true,
         id,
         value: r.data.value,
-        percentile: r.data.percentile,
+        percentile: pct,
         remaining: await countPending(goIds),
         retryAfterMs: null,
       };
@@ -743,8 +890,12 @@ async function tick(
 
 async function countPending(goIds: string[]): Promise<number> {
   const refreshAt = (await kv.get<number>(KV_GO_REFRESH)).value ?? 0;
+  const aaIdx = await getAaIndex(goIds);
+  const covered = aaIdx ? aaCoveredIds(aaIdx, goIds) : new Set<string>();
   let remaining = 0;
   for (const id of goIds) {
+    // AA-covered models resolve via bulk, never via ticks.
+    if (covered.has(id)) continue;
     const cached = await kv.get<CachedModel>(kvModelKey(id));
     if (!cached.value) {
       remaining++;
@@ -868,9 +1019,11 @@ async function handler(req: Request): Promise<Response> {
       return json(result);
     }
 
-    // Debug: per-model cache status + AA coverage (no fetch).
+    // Debug: per-model cache status + AA coverage + limits (no fetch).
     if (url.searchParams.get("debug") === "1") {
       const aaIdx = await getAaIndex(goIds);
+      const limitsEntry = await kv.get<GoLimits>(["go-limits"]);
+      const goLimits = limitsEntry.value?.limits ?? {};
       const out: Record<string, unknown>[] = [];
       for (const id of goIds) {
         const cached = await kv.get<CachedModel>(kvModelKey(id));
@@ -887,6 +1040,7 @@ async function handler(req: Request): Promise<Response> {
             ? cached.value.sourcesCount ?? null
             : null,
           fetchedAt: cached.value?.fetchedAt ?? null,
+          limits: goLimits[id] ?? null,
           aa: aaHit
             ? {
               slug: aaHit.slug ?? null,
