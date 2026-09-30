@@ -56,9 +56,22 @@ function aggBenchIndex() {
   return out;
 }
 
+// Docs publish "Unlimited" for non-metered models, so their value is unbounded:
+// they sort above every metered model and render as an infinity glyph. A
+// literal is fine: the em dashes already in this file rely on the same UTF-8
+// path, and /index.js is served as application/javascript with no charset.
+const INFINITY_GLYPH = "∞";
+
 function valueIndex(rows, aggScores) {
   const scored = [];
+  const unbounded = [];
   for (const r of rows) {
+    // Checked before the percentile guard: ∞ is a statement about limits, not
+    // about benchmarks, so it must show even with no benchmark data.
+    if (r.unlimited) {
+      unbounded.push(r.id);
+      continue;
+    }
     const pct = aggScores?.[r.id] ?? null;
     if (pct == null) continue;
     const rpm = r.reqPerMonth;
@@ -68,6 +81,7 @@ function valueIndex(rows, aggScores) {
   const max = Math.max(0, ...scored.map((s) => s.v));
   const m = {};
   for (const s of scored) m[s.id] = max > 0 ? (s.v / max) * 100 : 0;
+  for (const id of unbounded) m[id] = Infinity;
   return m;
 }
 
@@ -115,6 +129,9 @@ function render() {
     }
     if (av == null) av = -Infinity;
     if (bv == null) bv = -Infinity;
+    // Infinity - Infinity is NaN, which sort treats as "no swap" and would
+    // leave the unbounded rows in arbitrary order. Tiebreak deterministically.
+    if (av === Infinity && bv === Infinity) return a.id.localeCompare(b.id);
     if (typeof av === "string") return sortDir * av.localeCompare(bv);
     return sortDir * (av - bv);
   });
@@ -122,7 +139,9 @@ function render() {
   const tb = document.getElementById("tbody");
   tb.innerHTML = "";
   for (const r of rows) {
-    const valCell = r._val == null
+    const valCell = r._val === Infinity
+      ? INFINITY_GLYPH
+      : r._val == null
       ? '<span class="na">—</span>'
       : r._val.toFixed(1);
     const benchCell = (v) =>
@@ -130,22 +149,21 @@ function render() {
     const aggBenchCell = r._aggBench == null
       ? '<span class="na">—</span>'
       : r._aggBench.toFixed(1);
+    // Counts are null on unlimited rows, so the dash would be misleading.
+    const reqCell = (v) =>
+      r.unlimited
+        ? INFINITY_GLYPH
+        : v == null
+        ? '<span class="na">—</span>'
+        : fmtNum(v);
 
     let html = "<td>" + escapeHtml(r.id) + "</td>" +
       "<td>" +
       (r.creator ? escapeHtml(r.creator) : '<span class="na">—</span>') +
       "</td>" +
-      '<td class="num">' +
-      (r.reqPer5h == null ? '<span class="na">—</span>' : fmtNum(r.reqPer5h)) +
-      "</td>" +
-      '<td class="num">' + (r.reqPerWeek == null
-        ? '<span class="na">—</span>'
-        : fmtNum(r.reqPerWeek)) +
-      "</td>" +
-      '<td class="num">' + (r.reqPerMonth == null
-        ? '<span class="na">—</span>'
-        : fmtNum(r.reqPerMonth)) +
-      "</td>";
+      '<td class="num">' + reqCell(r.reqPer5h) + "</td>" +
+      '<td class="num">' + reqCell(r.reqPerWeek) + "</td>" +
+      '<td class="num">' + reqCell(r.reqPerMonth) + "</td>";
     for (const slug of benchSlugs) {
       html += '<td class="num">' + benchCell(r.benchmarks[slug]) + "</td>";
     }

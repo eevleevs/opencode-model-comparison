@@ -70,7 +70,21 @@ async function fetchJson(
         : 10;
       throw new RateLimitedError(secs * 1000);
     }
-    if (!res.ok) throw new HttpError(res.status, `GET ${url} -> ${res.status}`);
+    if (!res.ok) {
+      // Keep the parsed body: CloudPrice answers 409 multiple_matches with the
+      // candidate model ids, which is the only way to resolve an ambiguous id.
+      let body: unknown = null;
+      try {
+        body = await res.json();
+      } catch {
+        // Non-JSON error body; the status is all we get.
+      }
+      throw new HttpError(
+        res.status,
+        `GET ${url} -> ${res.status}`,
+        body,
+      );
+    }
     return res.json();
   } finally {
     clearTimeout(timer);
@@ -87,140 +101,157 @@ class RateLimitedError extends Error {
 
 class HttpError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  // Parsed error payload when the response had one (see fetchJson).
+  body: unknown;
+  constructor(status: number, message: string, body: unknown = null) {
     super(message);
     this.status = status;
+    this.body = body;
   }
-}
-
-// ---------------------------------------------------------------------------
-// Markdown table parser (for Go docs limits)
-// ---------------------------------------------------------------------------
-
-function parseTableRow(line: string): string[] {
-  return line
-    .trim()
-    .replace(/^\|/, "")
-    .replace(/\|$/, "")
-    .split("|")
-    .map((cell) => cell.trim());
-}
-
-function parseMarkdownTables(
-  text: string,
-): Map<string, { headers: string[]; rows: string[][] }> {
-  const tables = new Map<string, { headers: string[]; rows: string[][] }>();
-  const lines = text.split("\n");
-  let i = 0;
-  while (i < lines.length) {
-    if (lines[i].trim().startsWith("|")) {
-      const tableLines: string[] = [];
-      while (i < lines.length && lines[i].trim().startsWith("|")) {
-        tableLines.push(lines[i]);
-        i++;
-      }
-      if (tableLines.length >= 3) {
-        const headers = parseTableRow(tableLines[0]);
-        const rows: string[][] = [];
-        for (let j = 2; j < tableLines.length; j++) {
-          rows.push(parseTableRow(tableLines[j]));
-        }
-        tables.set(headers.join("|"), { headers, rows });
-      }
-    } else {
-      i++;
-    }
-  }
-  return tables;
-}
-
-function findTable(
-  tables: Map<string, { headers: string[]; rows: string[][] }>,
-  headerMatch: string,
-) {
-  for (const [, table] of tables) {
-    if (table.headers.some((h) => h.includes(headerMatch))) {
-      return table;
-    }
-  }
-  return null;
 }
 
 // ---------------------------------------------------------------------------
 // Go utilization limits (from docs MDX)
 // ---------------------------------------------------------------------------
 
+type GoLimit = {
+  // Null on every count when unlimited is true. Never Infinity: this value is
+  // serialized to the client, and JSON.stringify turns Infinity into null.
+  reqPer5h: number | null;
+  reqPerWeek: number | null;
+  reqPerMonth: number | null;
+  // The docs publish "Unlimited" for non-metered models, which is a distinct
+  // state from "no data": these are ranked first and flagged with an ∞ glyph.
+  unlimited?: boolean;
+};
+
 type GoLimits = {
-  limits: Record<
-    string,
-    { reqPer5h: number; reqPerWeek: number; reqPerMonth: number }
-  >;
+  limits: Record<string, GoLimit>;
   fetchedAt: number;
 };
 
-const GO_LIMITS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+// The docs change whenever OpenCode adjusts a plan or a promo multiplier
+// ("4x · Ends Sep 20"), so a weekly snapshot can outlive the numbers in it.
+// One unauthenticated raw.githubusercontent fetch a day is cheap.
+const GO_LIMITS_TTL_MS = 24 * 60 * 60 * 1000;
 
 import {
   aaRankPercentile,
   cleanName,
   cleanReqCount,
+  collapseCreator,
+  creatorCandidates,
+  creatorFamily,
+  findTable,
+  findTables,
+  knownCreator,
+  parseMarkdownTables,
+  pendingCreatorModels,
   rankPercentile,
 } from "./pure.ts";
+
+// The docs publish the request-limits table once per plan ("Go" and "Go Plus")
+// with identical headers. They used to differ enough to be distinguishable, so
+// the first match won and the leaderboard showed Go-plan limits; now they are
+// byte-identical, so the choice has to be explicit or it flips silently and
+// inflates every Value by ~3x. Index 0 is "Go" ($10/mo), index 1 is
+// "Go Plus" ($40/mo).
+const GO_LIMITS_PLAN_INDEX = 0;
+
+// Fetch and parse the Go docs. Returns null instead of throwing so a broken
+// or mid-edit upstream file cannot empty the limits column: stale numbers are
+// recoverable, a blank column is not.
+async function refetchGoLimits(): Promise<GoLimits["limits"] | null> {
+  try {
+    console.log("[build] fetching Go docs MDX...");
+    const res = await fetch(GO_DOCS_URL, {
+      headers: { "user-agent": "opencode-go-leaderboard/1.0" },
+    });
+    if (!res.ok) throw new Error(`GET ${GO_DOCS_URL} -> ${res.status}`);
+    const mdx = await res.text();
+    const tables = parseMarkdownTables(mdx);
+    const endpointsTable = findTable(tables, "Model ID");
+    const requestsTables = findTables(tables, "requests per 5 hour");
+    const requestsTable = requestsTables[GO_LIMITS_PLAN_INDEX];
+    if (!endpointsTable || !requestsTable) {
+      throw new Error(
+        `Failed to parse Go docs tables (found ${requestsTables.length} request tables)`,
+      );
+    }
+    const displayNameToId = new Map<string, string>();
+    for (const row of endpointsTable.rows) {
+      const displayName = cleanName(row[0]);
+      const modelId = row[1]?.trim();
+      if (displayName && modelId) displayNameToId.set(displayName, modelId);
+    }
+    const limits: GoLimits["limits"] = {};
+    const skipped: string[] = [];
+    const unlimited: string[] = [];
+    for (const row of requestsTable.rows) {
+      const displayName = cleanName(row[0]);
+      const reqPer5h = cleanReqCount(row[1]);
+      const reqPerWeek = cleanReqCount(row[2]);
+      const reqPerMonth = cleanReqCount(row[3]);
+      const id = displayNameToId.get(displayName);
+      if (!id) {
+        skipped.push(`${displayName} (no endpoint id)`);
+        continue;
+      }
+      if (reqPer5h === Infinity && reqPerWeek === Infinity && reqPerMonth === Infinity) {
+        // "Unlimited" in all three columns: not metered at all. Counts are null
+        // so the client flags it rather than ranking a fake number.
+        limits[id] = {
+          reqPer5h: null,
+          reqPerWeek: null,
+          reqPerMonth: null,
+          unlimited: true,
+        };
+        unlimited.push(displayName);
+        continue;
+      }
+      if (isNaN(reqPer5h) || isNaN(reqPerWeek) || isNaN(reqPerMonth)) {
+        // Covers both unreadable cells and a mix of metered and Unlimited,
+        // which is a docs inconsistency rather than a state we can rank.
+        skipped.push(`${displayName} (unparsed counts)`);
+        continue;
+      }
+      limits[id] = { reqPer5h, reqPerWeek, reqPerMonth };
+    }
+    if (skipped.length) {
+      console.log(`[build] limits skipped rows: ${skipped.join("; ")}`);
+    }
+    if (unlimited.length) {
+      console.log(`[build] unlimited models: ${unlimited.join(", ")}`);
+    }
+    console.log(
+      `[build] parsed ${Object.keys(limits).length} model limits from Go docs`,
+    );
+    return limits;
+  } catch (e) {
+    console.log(`[build] Go docs fetch/parse failed: ${(e as Error).message}`);
+    return null;
+  }
+}
 
 async function fetchGoLimits(
   forceRefresh = false,
 ): Promise<GoLimits["limits"]> {
-  const kvKey = ["go-limits"];
-  if (!forceRefresh) {
-    const entry = await kv.get<GoLimits>(kvKey);
-    if (entry.value && Date.now() - entry.value.fetchedAt < GO_LIMITS_TTL_MS) {
-      return entry.value.limits;
+  const previous = await kv.get<GoLimits>(KV_GO_LIMITS);
+  const cached = previous.value;
+  if (!forceRefresh && cached && Date.now() - cached.fetchedAt < GO_LIMITS_TTL_MS) {
+    return cached.limits;
+  }
+  const refreshed = await refetchGoLimits();
+  if (!refreshed) {
+    // Keep serving the last good snapshot rather than blanking every row.
+    if (cached) {
+      console.log("[build] keeping cached limits snapshot");
+      return cached.limits;
     }
+    throw new Error("Go docs limits unavailable and nothing cached");
   }
-  console.log("[build] fetching Go docs MDX...");
-  const res = await fetch(GO_DOCS_URL, {
-    headers: { "user-agent": "opencode-go-leaderboard/1.0" },
-  });
-  if (!res.ok) throw new Error(`GET ${GO_DOCS_URL} -> ${res.status}`);
-  const mdx = await res.text();
-  const tables = parseMarkdownTables(mdx);
-  const endpointsTable = findTable(tables, "Model ID");
-  const requestsTable = findTable(tables, "requests per 5 hour");
-  if (!endpointsTable || !requestsTable) {
-    throw new Error("Failed to parse Go docs tables");
-  }
-  const displayNameToId = new Map<string, string>();
-  for (const row of endpointsTable.rows) {
-    const displayName = cleanName(row[0]);
-    const modelId = row[1]?.trim();
-    if (displayName && modelId) displayNameToId.set(displayName, modelId);
-  }
-  const limits: GoLimits["limits"] = {};
-  const skipped: string[] = [];
-  for (const row of requestsTable.rows) {
-    const displayName = cleanName(row[0]);
-    const reqPer5h = cleanReqCount(row[1]);
-    const reqPerWeek = cleanReqCount(row[2]);
-    const reqPerMonth = cleanReqCount(row[3]);
-    const id = displayNameToId.get(displayName);
-    if (!id) {
-      skipped.push(`${displayName} (no endpoint id)`);
-      continue;
-    }
-    if (isNaN(reqPer5h) || isNaN(reqPerWeek) || isNaN(reqPerMonth)) {
-      skipped.push(`${displayName} (unparsed counts)`);
-      continue;
-    }
-    limits[id] = { reqPer5h, reqPerWeek, reqPerMonth };
-  }
-  if (skipped.length) {
-    console.log(`[build] limits skipped rows: ${skipped.join("; ")}`);
-  }
-  console.log(
-    `[build] parsed ${Object.keys(limits).length} model limits from Go docs`,
-  );
-  await kv.set(kvKey, { limits, fetchedAt: Date.now() });
-  return limits;
+  await kv.set(KV_GO_LIMITS, { limits: refreshed, fetchedAt: Date.now() });
+  return refreshed;
 }
 
 // ---------------------------------------------------------------------------
@@ -231,6 +262,10 @@ const kv = await Deno.openKv();
 const KV_GO_IDS = ["go", "ids"];
 const KV_GO_CHECKED = ["go", "checkedAt"];
 const KV_GO_REFRESH = ["go", "refreshAt"];
+// Parsed from the Go docs MDX. Invalidated when the Go model list gains a
+// model, so a new model gets limits on the next request instead of waiting
+// out the TTL.
+const KV_GO_LIMITS = ["go-limits"];
 
 function kvModelKey(id: string): string[] {
   return ["model", id];
@@ -366,9 +401,13 @@ const kvAaDistKey = (slug: string): string[] => [...KV_AA_DIST_PREFIX, slug];
 type AaBulkModel = {
   slug?: string;
   name?: string;
-  openrouter_api_id?: string;
+  // Vendor of the model, e.g. { id, name: "Anthropic", slug: "anthropic" }.
+  // This is the creator source: present on every model in the v2 bulk payload.
+  model_creator?: AaCreator;
   evaluations?: Record<string, number | null>;
 };
+
+type AaCreator = { id?: string; name?: string; slug?: string };
 
 type AaBulkCache = { models: AaBulkModel[]; fetchedAt: number };
 
@@ -406,13 +445,6 @@ function buildAaIndex(models: AaBulkModel[]): Map<string, AaBulkModel> {
     if (m.name) {
       keys.add(m.name.toLowerCase());
       keys.add(normId(m.name));
-    }
-    if (m.openrouter_api_id) {
-      const full = m.openrouter_api_id.toLowerCase();
-      keys.add(full);
-      const short = full.split("/").pop()!;
-      keys.add(short);
-      keys.add(normId(short));
     }
     for (const k of keys) {
       if (!idx.has(k)) idx.set(k, m);
@@ -459,7 +491,7 @@ function compactAaModel(m: AaBulkModel): AaBulkModel {
   return {
     slug: m.slug,
     name: m.name,
-    openrouter_api_id: m.openrouter_api_id,
+    model_creator: m.model_creator,
     evaluations: compact,
   };
 }
@@ -601,6 +633,200 @@ async function getAaIndex(
 }
 
 // ---------------------------------------------------------------------------
+// Creator (vendor) resolution
+// ---------------------------------------------------------------------------
+// Resolved per model id. AA is primary and carries model_creator for most of
+// the Go list, free from the bulk we already hold; CloudPrice's single-model
+// endpoint fills only the models AA does not cover, one per tick.
+//
+// A creator is either resolved (slug), empty (""), or not attempted yet. An
+// empty creator is rendered as the client's default placeholder rather than
+// guessed, and earns one further lookup at the next manual refresh. Only
+// un-attempted models and empty ones with that retry unspent count as pending,
+// which is what guarantees the client poll loop terminates.
+
+const KV_CREATORS = ["meta", "creators"];
+
+type CreatorState = {
+  // model id -> creator slug, or "" when no creator is available.
+  creators: Record<string, string>;
+  // first word -> slug, learned only from a model that actually resolved. Lets
+  // a sibling model reuse a known creator instead of spending a request, and is
+  // never written from a miss.
+  families: Record<string, string>;
+  // Exact CloudPrice id to retry, when a 409 handed us candidate ids. Its
+  // presence also marks the one in-cycle retry as spent.
+  pendingCandidate: Record<string, string>;
+  // model id -> timestamp once this refresh cycle's retry has been spent on an
+  // empty creator. Cleared by ?refresh=1, which grants one more attempt.
+  retried: Record<string, number>;
+};
+
+async function loadCreatorState(): Promise<CreatorState> {
+  const entry = await kv.get<CreatorState>(KV_CREATORS);
+  const v = entry.value as Partial<CreatorState> | null;
+  // Tolerate entries written by an earlier shape rather than blowing up on a
+  // missing field: creators is the only one that must exist.
+  return {
+    creators: v?.creators ?? {},
+    families: v?.families ?? {},
+    pendingCandidate: v?.pendingCandidate ?? {},
+    retried: v?.retried ?? {},
+  };
+}
+
+async function saveCreatorState(state: CreatorState): Promise<void> {
+  await kv.set(KV_CREATORS, state);
+}
+
+function markCreatorResolved(state: CreatorState, id: string, slug: string): void {
+  state.creators[id] = slug;
+  // First real answer for this family wins, so the family stays self-consistent
+  // no matter which source taught it.
+  const family = creatorFamily(id);
+  if (family && !state.families[family]) state.families[family] = slug;
+  delete state.pendingCandidate[id];
+  delete state.retried[id];
+}
+
+// No creator available. Carry it as empty and spend this cycle's retry so the
+// model stops counting as pending; ?refresh=1 clears that and tries once more.
+// Deliberately does not touch families: a miss for one model says nothing
+// about its siblings.
+function markCreatorEmpty(state: CreatorState, id: string): void {
+  state.creators[id] = "";
+  state.retried[id] = Date.now();
+  delete state.pendingCandidate[id];
+}
+
+// Seed from the AA bulk we already hold. Free, and it means the models AA
+// covers never cost a CloudPrice call. Also upgrades an empty creator if AA
+// has started covering a model it previously missed.
+async function seedCreatorsFromAa(
+  goIds: string[],
+  idx: Map<string, AaBulkModel> | null,
+): Promise<CreatorState> {
+  const state = await loadCreatorState();
+  if (!idx) return state;
+  let changed = false;
+  for (const id of goIds) {
+    if (state.creators[id]) continue;
+    const slug = lookupAa(idx, id)?.model_creator?.slug;
+    if (!slug) continue;
+    markCreatorResolved(state, id, slug);
+    changed = true;
+    console.log(`[creator] seeded ${id} -> ${slug} from AA`);
+  }
+  if (changed) await saveCreatorState(state);
+  return state;
+}
+
+// Vendor prefix of each 409 candidate id: "xai-grok-4-7" -> "xai".
+function creatorPrefixes(candidates: string[]): string[] {
+  return candidates.map((id) => id.split("-")[0] ?? "");
+}
+
+type CreatorLookup =
+  | { kind: "ok"; creator: string }
+  | { kind: "empty" }
+  | { kind: "ambiguous"; candidates: string[] }
+  | { kind: "rateLimited"; retryAfterMs: number }
+  | { kind: "error" };
+
+// One CloudPrice model lookup. The catalog gains variants continuously, so an
+// id can flip between 200 and 409 (multiple_matches) at any time; the 409 body
+// carries the candidate ids to collapse.
+async function lookupCreator(cpiId: string): Promise<CreatorLookup> {
+  try {
+    const d = (await fetchJson(
+      `${CLOUDPRICE}/models/${encodeURIComponent(cpiId)}`,
+      TICK_BUDGET_MS,
+    )) as { data?: { creator?: string } };
+    const creator = d?.data?.creator;
+    return typeof creator === "string" && creator
+      ? { kind: "ok", creator }
+      : { kind: "empty" };
+  } catch (e) {
+    if (e instanceof RateLimitedError) {
+      return { kind: "rateLimited", retryAfterMs: e.retryAfterMs };
+    }
+    if (e instanceof HttpError && e.status === 404) return { kind: "empty" };
+    if (e instanceof HttpError && e.status === 409) {
+      return {
+        kind: "ambiguous",
+        candidates: creatorCandidates(e.body),
+      };
+    }
+    return { kind: "error" };
+  }
+}
+
+// Resolve at most one model's creator per request, keeping the tick's
+// one-CloudPrice-call-per-request invariant.
+async function tickCreator(
+  goIds: string[],
+  aaIdx: Map<string, AaBulkModel> | null,
+): Promise<{
+  touched: boolean;
+  retryAfterMs: number | null;
+}> {
+  // Seed from AA first: a manual refresh drops the memo, and without this the
+  // models AA already covers would each cost a CloudPrice call.
+  const state = await seedCreatorsFromAa(goIds, aaIdx);
+  const pending = pendingCreatorModels(
+    goIds,
+    state.creators,
+    state.families,
+    state.retried,
+  );
+  if (!pending.length) return { touched: false, retryAfterMs: null };
+
+  const id = pending[0];
+  const cpiId = state.pendingCandidate[id] ?? id;
+  const r = await lookupCreator(cpiId);
+
+  if (r.kind === "rateLimited") {
+    // Nothing persisted: the model stays pending and the client waits out the
+    // retry-after.
+    return { touched: true, retryAfterMs: r.retryAfterMs };
+  }
+
+  let outcome: string;
+  if (r.kind === "ok") {
+    markCreatorResolved(state, id, r.creator);
+    outcome = "ok";
+  } else if (r.kind === "ambiguous") {
+    // Prefer collapsing the candidates: a 409 is usually one vendor listed
+    // under several variants or slugs ("z-ai" and "zhipu" for Z.AI).
+    const collapsed = collapseCreator(creatorPrefixes(r.candidates));
+    if (collapsed) {
+      markCreatorResolved(state, id, collapsed);
+      outcome = "ok";
+    } else if (!state.pendingCandidate[id]) {
+      // One in-cycle retry against an exact candidate id, which bypasses the
+      // fuzzy match that produced the ambiguity in the first place. Bounded:
+      // the second ambiguous answer falls through to empty below.
+      state.pendingCandidate[id] = r.candidates[0];
+      outcome = "ambiguous, retrying exact id";
+    } else {
+      markCreatorEmpty(state, id);
+      outcome = "ambiguous";
+    }
+  } else {
+    // 404, or a transient error. Either way we have no creator to show, so
+    // carry it empty and retry once at the next refresh.
+    markCreatorEmpty(state, id);
+    outcome = r.kind;
+  }
+
+  await saveCreatorState(state);
+  console.log(
+    `[creator] ${id} -> ${state.creators[id] || "(empty)"} via ${cpiId} (${outcome})`,
+  );
+  return { touched: true, retryAfterMs: null };
+}
+
+// ---------------------------------------------------------------------------
 // Go model list (change detection)
 // ---------------------------------------------------------------------------
 
@@ -634,6 +860,10 @@ async function ensureGoIds(): Promise<string[]> {
     if (added.length) {
       // Reset checkedAt so ticks immediately start fetching the new models.
       await kv.delete(KV_GO_CHECKED);
+      // The docs publish limits per model, so a new model has none in the
+      // cached snapshot and would show no limits (and no Value) until the TTL
+      // expired. Drop the snapshot instead; the next fetch is one MDX request.
+      await kv.delete(KV_GO_LIMITS);
     }
     await kv.set(KV_GO_IDS, live);
   }
@@ -661,6 +891,10 @@ type Row = {
   reqPer5h: number | null;
   reqPerWeek: number | null;
   reqPerMonth: number | null;
+  // Docs publish "Unlimited" for non-metered models: counts are null and this
+  // flag is set, so the client flags them and ranks them above metered models
+  // instead of rendering a misleading dash.
+  unlimited: boolean;
   benchmarks: Record<string, number | null>;
   percentiles: Record<string, number | null>;
   matched: boolean;
@@ -676,11 +910,8 @@ type BuildState = {
 
 async function assembleBuild(goIds: string[]): Promise<BuildState> {
   // Load any Go limits we already have; never fetch them in the hot path.
-  let goLimits: Record<
-    string,
-    { reqPer5h: number; reqPerWeek: number; reqPerMonth: number }
-  > = {};
-  const limitsEntry = await kv.get<GoLimits>(["go-limits"]);
+  let goLimits: Record<string, GoLimit> = {};
+  const limitsEntry = await kv.get<GoLimits>(KV_GO_LIMITS);
   if (limitsEntry.value) goLimits = limitsEntry.value.limits;
 
   const entries = new Map<string, CachedModel>();
@@ -696,6 +927,12 @@ async function assembleBuild(goIds: string[]): Promise<BuildState> {
   const aaData = await getAaData(goIds);
   const aaIdx = aaData?.idx ?? null;
   const aaDists = aaData?.dists ?? null;
+
+  // Memoized first-word -> creator. Also seeds every token AA covers, so most
+  // tokens never need a CloudPrice call.
+  const creatorState = await seedCreatorsFromAa(goIds, aaIdx);
+  const creatorTokens = creatorState.creators;
+  const creatorFamilies = creatorState.families;
 
   const rows: Row[] = [];
   let matchedCount = 0;
@@ -745,9 +982,11 @@ async function assembleBuild(goIds: string[]): Promise<BuildState> {
 
     // AA wins where present (fresher than the CloudPrice snapshot):
     // overwrite values and derive rank percentiles from catalog dists.
+    let aaCreator = "";
     if (aaIdx) {
       const hit = lookupAa(aaIdx, id);
       if (hit) {
+        aaCreator = hit.model_creator?.slug ?? "";
         const { value } = aaValuesFor(hit);
         let filledThis = false;
         let pctThis = false;
@@ -768,8 +1007,15 @@ async function assembleBuild(goIds: string[]): Promise<BuildState> {
       }
     }
 
-    const parts = id.split(/[-.]/);
-    const creator = parts.length > 1 ? parts[0] : "";
+    // Creator: AA's per-model slug, else a memoized per-model answer, else a
+    // family hint learned from a real answer, else "" so the client shows its
+    // default placeholder rather than a guessed vendor.
+    const creator = knownCreator(
+      id,
+      aaCreator || undefined,
+      creatorTokens,
+      creatorFamilies,
+    );
 
     if (matchedAny) matchedCount++;
 
@@ -780,13 +1026,14 @@ async function assembleBuild(goIds: string[]): Promise<BuildState> {
       reqPer5h: limits?.reqPer5h ?? null,
       reqPerWeek: limits?.reqPerWeek ?? null,
       reqPerMonth: limits?.reqPerMonth ?? null,
+      unlimited: limits?.unlimited ?? false,
       benchmarks,
       percentiles,
       matched: matchedAny,
     });
   }
 
-  const remaining = await countPending(goIds);
+  const remaining = await countPending(goIds, creatorState);
 
   console.log(
     `[tick] assemble: ${matchedCount}/${goIds.length} matched, ${remaining} pending, aaFilled=${aaFilled}, aaPct=${aaPctFilled}, emptyReasons=${JSON.stringify(emptyReasons)}, aa=${aaIdx ? "on" : "off"}, limits=${limitsCount}/${goIds.length} noLimits=[${noLimits.join(",")}]`,
@@ -822,6 +1069,20 @@ async function tick(
   const refreshAt = (await kv.get<number>(KV_GO_REFRESH)).value ?? 0;
   const aaIdx = await getAaIndex(goIds);
   const covered = aaIdx ? aaCoveredIds(aaIdx, goIds) : new Set<string>();
+
+  // Unresolved creator tokens take the tick slot when there is one. Taking it
+  // here rather than appending a call keeps the one-CloudPrice-call-per-request
+  // invariant, and creators land before the slower benchmark crawl.
+  const creator = await tickCreator(goIds, aaIdx);
+  if (creator.touched) {
+    return {
+      fetched: false,
+      id: null,
+      remaining: await countPending(goIds),
+      retryAfterMs: creator.retryAfterMs,
+    };
+  }
+
   for (const id of goIds) {
     if (Date.now() > deadlineMs) break;
 
@@ -888,11 +1149,23 @@ async function tick(
   return { fetched: false, id: null, remaining: await countPending(goIds), retryAfterMs: null };
 }
 
-async function countPending(goIds: string[]): Promise<number> {
+async function countPending(
+  goIds: string[],
+  seeded?: CreatorState,
+): Promise<number> {
   const refreshAt = (await kv.get<number>(KV_GO_REFRESH)).value ?? 0;
   const aaIdx = await getAaIndex(goIds);
   const covered = aaIdx ? aaCoveredIds(aaIdx, goIds) : new Set<string>();
-  let remaining = 0;
+  // Unresolved creator tokens count as pending so the client's poll loop keeps
+  // going; terminal negatives do not, which is what makes the loop terminate.
+  // Callers that already seeded pass the state in rather than re-reading KV.
+  const creatorState = seeded ?? await seedCreatorsFromAa(goIds, aaIdx);
+  let remaining = pendingCreatorModels(
+    goIds,
+    creatorState.creators,
+    creatorState.families,
+    creatorState.retried,
+  ).length;
   for (const id of goIds) {
     // AA-covered models resolve via bulk, never via ticks.
     if (covered.has(id)) continue;
@@ -1003,7 +1276,11 @@ async function handler(req: Request): Promise<Response> {
     const t1 = performance.now();
     console.log(`[perf] ensureGoIds ${(t1 - t0).toFixed(1)}ms`);
     const isRefresh = url.searchParams.get("refresh") === "1";
-    if (!isRefresh && await kv.get(["go-limits"]).then((e) => !e.value)) {
+    // Always ask: fetchGoLimits returns the cached snapshot when it is still
+    // inside the TTL, so the only cost is one KV read. Gating this on key
+    // absence (as it used to be) meant the TTL check was unreachable and the
+    // snapshot never expired.
+    if (!isRefresh) {
       try {
         await fetchGoLimits();
       } catch (e) {
@@ -1022,7 +1299,7 @@ async function handler(req: Request): Promise<Response> {
     // Debug: per-model cache status + AA coverage + limits (no fetch).
     if (url.searchParams.get("debug") === "1") {
       const aaIdx = await getAaIndex(goIds);
-      const limitsEntry = await kv.get<GoLimits>(["go-limits"]);
+      const limitsEntry = await kv.get<GoLimits>(KV_GO_LIMITS);
       const goLimits = limitsEntry.value?.limits ?? {};
       const out: Record<string, unknown>[] = [];
       for (const id of goIds) {
@@ -1044,7 +1321,7 @@ async function handler(req: Request): Promise<Response> {
           aa: aaHit
             ? {
               slug: aaHit.slug ?? null,
-              openrouter: aaHit.openrouter_api_id ?? null,
+              creator: aaHit.model_creator?.slug ?? null,
               values: aaVals,
             }
             : null,
@@ -1066,6 +1343,9 @@ async function handler(req: Request): Promise<Response> {
       await kv.set(KV_GO_IDS, live);
       await kv.set(KV_GO_REFRESH, Date.now());
       await kv.set(KV_GO_CHECKED, Date.now());
+      // Drop memoized creators so ticks re-resolve them; AA re-seeds the
+      // tokens it covers for free.
+      await kv.delete(KV_CREATORS);
       try {
         await fetchGoLimits(true);
       } catch (e) {
