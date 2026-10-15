@@ -5,6 +5,10 @@
   // Node-compat default date per Cloudflare's 2026 guidance; the app itself
   // doesn't need any compat flags.
   "compatibility_date": "2026-08-04",
+  // Published at opencode-model-comparison.insondabile.workers.dev.
+  // Explicit so deploys don't warn about unset defaults.
+  "workers_dev": true,
+  "preview_urls": true,
   // index.html/js/css are imported as text modules (the same shape
   // Deno.readTextFile gave the old Deno Deploy version). Globs are matched
   // against the import specifier, not the file path, so they must be written
@@ -24,10 +28,7 @@
   "kv_namespaces": [
     {
       "binding": "KV",
-      // Replace with the id from `bunx wrangler kv namespace create KV`
-      // (see README). All-zero is a syntactically valid placeholder so
-      // `deno task dev` works before the namespace exists.
-      "id": "00000000000000000000000000000000"
+      "id": "706b691028474d24bd7a6c39dbf6c7c5"
     }
   ]
 }
