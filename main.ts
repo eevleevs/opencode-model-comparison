@@ -15,8 +15,10 @@
 // Local: copy .env.example to .env for AA_API_KEY (see README).
 
 const OC_GO_MODELS_URL = "https://opencode.ai/zen/go/v1/models";
+// The docs live under services/www since the docs site moved to /v2/docs/...
+// (the old packages/web/src/content/docs/go.mdx path 404s).
 const GO_DOCS_URL =
-  "https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/web/src/content/docs/go.mdx";
+  "https://raw.githubusercontent.com/anomalyco/opencode/dev/services/www/src/docs/content/console/go.mdx";
 const CLOUDPRICE = "https://ai.cloudprice.net/api/v1";
 
 const BENCHMARKS = [
@@ -222,6 +224,13 @@ async function refetchGoLimits(): Promise<GoLimits["limits"] | null> {
     }
     if (unlimited.length) {
       console.log(`[build] unlimited models: ${unlimited.join(", ")}`);
+    }
+    // A parse that yields 0 rows is a failure, not an empty dataset: returning
+    // it would overwrite the last good snapshot with {} and blank Req/mo (and
+    // with it Value) for every row. Throwing lands in the catch below, which
+    // returns null so the caller keeps serving the cached snapshot.
+    if (Object.keys(limits).length === 0) {
+      throw new Error("Go docs parsed 0 model limits");
     }
     console.log(
       `[build] parsed ${Object.keys(limits).length} model limits from Go docs`,
@@ -862,8 +871,17 @@ async function ensureGoIds(): Promise<string[]> {
       await kv.delete(KV_GO_CHECKED);
       // The docs publish limits per model, so a new model has none in the
       // cached snapshot and would show no limits (and no Value) until the TTL
-      // expired. Drop the snapshot instead; the next fetch is one MDX request.
-      await kv.delete(KV_GO_LIMITS);
+      // expired. Age the snapshot instead of deleting it: a stale entry is due
+      // for a refetch on the next request, but fetchGoLimits() still falls back
+      // to it when that fetch fails. Deleting meant a single upstream 404 right
+      // after a model was added blanked Req/mo and Value for every row.
+      const staleLimits = await kv.get<GoLimits>(KV_GO_LIMITS);
+      if (staleLimits.value) {
+        await kv.set(KV_GO_LIMITS, {
+          ...staleLimits.value,
+          fetchedAt: Date.now() - GO_LIMITS_TTL_MS,
+        });
+      }
     }
     await kv.set(KV_GO_IDS, live);
   }

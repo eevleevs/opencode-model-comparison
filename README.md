@@ -9,7 +9,7 @@ Ranks the latest models on OpenCode Go by **value** = coding benchmark performan
 | Value | `AggBench / 100 × requests/month`, normalized so the best model scores 100 |
 | Utilization | Requests per 5 hours / week / month from the OpenCode Go docs |
 
-Sources: [opencode.ai/zen/go/models](https://opencode.ai/zen/go/v1/models), the [Go docs](https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/web/src/content/docs/go.mdx), and [CloudPrice](https://ai.cloudprice.net/api/v1).
+Sources: [opencode.ai/zen/go/models](https://opencode.ai/zen/go/v1/models), the [Go docs](https://raw.githubusercontent.com/anomalyco/opencode/dev/services/www/src/docs/content/console/go.mdx), and [CloudPrice](https://ai.cloudprice.net/api/v1).
 
 ## Why the tick-based build?
 
