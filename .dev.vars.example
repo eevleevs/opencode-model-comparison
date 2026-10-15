@@ -1,0 +1,4 @@
+# Copy to .dev.vars (gitignored) for local `deno task dev`.
+# Production: `bunx wrangler secret put AA_API_KEY`
+# Missing key = silent fallback to CloudPrice-only (see README).
+AA_API_KEY=

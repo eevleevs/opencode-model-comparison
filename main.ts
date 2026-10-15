@@ -4,15 +4,17 @@
 // bulk; fallback: CloudPrice per-model), then ranks them by a "value" score
 // = benchmark performance × requests per month.
 //
-// Deno Deploy is serverless: isolates idle-shutdown and requests that run too
-// long are killed (502). So NO request ever does more than one CloudPrice call
-// or one AA bulk call. AA-covered models resolve via the daily bulk cache;
-// the client polls GET /?tick=1 (one CloudPrice fetch per tick) only for
-// AA-misses until those resolve. The page always renders whatever is in KV
-// immediately (stale-while-revalidate).
+// Runs on Cloudflare Workers (migrated from Deno Deploy, which shuts down in
+// ~April 2027). Persistence is Workers KV behind the KvLike adapter below,
+// which mirrors the subset of the Deno KV API this app uses. NO request ever
+// does more than one CloudPrice call or one AA bulk call: the client polls
+// GET /?tick=1 (one CloudPrice fetch per tick) only for AA-misses until those
+// resolve. The page always renders whatever is in KV immediately
+// (stale-while-revalidate). KV only holds a rebuildable cache, so losing it
+// just triggers a rebuild — there is no data to migrate.
 //
-// Deploy: `deno run --allow-net --allow-read --allow-env --unstable-kv main.ts`
-// Local: copy .env.example to .env for AA_API_KEY (see README).
+// Deploy: `deno task deploy` (wrangler; see README).
+// Local:  `deno task dev`, with AA_API_KEY in .dev.vars (.dev.vars.example).
 
 const OC_GO_MODELS_URL = "https://opencode.ai/zen/go/v1/models";
 // The docs live under services/www since the docs site moved to /v2/docs/...
@@ -33,12 +35,16 @@ const BENCHMARKS = [
   { slug: "hle", label: "HLE", coding: false },
 ];
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-// Hard wall-clock budget for one tick request so it can never approach the
-// Deno Deploy request limit. CloudPrice replies in tens of ms normally; 15s
-// covers even pathological 429 retry-after values without sleeping forever.
+// Hard wall-clock budget for one tick request. CloudPrice replies in tens of
+// ms normally; 15s covers pathological upstream latency. Transient failures
+// do NOT burn the budget sleeping (Workers dislikes long-lived requests):
+// the tick returns retryAfterMs instead and the client backs off.
 const TICK_BUDGET_MS = 15000;
+
+// How long an in-isolate memo may serve AA/limits data without touching KV.
+// Workers reuses isolates across requests, so this cuts KV reads (the
+// tightest free-tier quota) to ~zero for steady traffic.
+const MEMO_TTL_MS = 60_000;
 
 // Data never expires, but auto-refresh if older than this (1 week).
 const STALE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -152,6 +158,12 @@ import {
   rankPercentile,
 } from "./pure.ts";
 
+// Static assets are bundled as text modules (wrangler.jsonc `rules`), the
+// Workers equivalent of the old Deno.readTextFile() calls.
+import CLIENT_CSS from "./index.css";
+import CLIENT_JS from "./index.js";
+import HTML_PAGE from "./index.html";
+
 // The docs publish the request-limits table once per plan ("Go" and "Go Plus")
 // with identical headers. They used to differ enough to be distinguishable, so
 // the first match won and the leaderboard showed Go-plan limits; now they are
@@ -242,12 +254,24 @@ async function refetchGoLimits(): Promise<GoLimits["limits"] | null> {
   }
 }
 
+// In-isolate memo of the last good snapshot: the handler asks on every
+// request, and Workers reuses isolates, so a memory read replaces a KV read
+// (see MEMO_TTL_MS). ?refresh=1 passes forceRefresh and updates it.
+let limitsMemo: { limits: GoLimits["limits"]; at: number } | null = null;
+
 async function fetchGoLimits(
   forceRefresh = false,
 ): Promise<GoLimits["limits"]> {
+  if (
+    !forceRefresh && limitsMemo &&
+    Date.now() - limitsMemo.at < MEMO_TTL_MS
+  ) {
+    return limitsMemo.limits;
+  }
   const previous = await kv.get<GoLimits>(KV_GO_LIMITS);
   const cached = previous.value;
   if (!forceRefresh && cached && Date.now() - cached.fetchedAt < GO_LIMITS_TTL_MS) {
+    limitsMemo = { limits: cached.limits, at: Date.now() };
     return cached.limits;
   }
   const refreshed = await refetchGoLimits();
@@ -255,19 +279,97 @@ async function fetchGoLimits(
     // Keep serving the last good snapshot rather than blanking every row.
     if (cached) {
       console.log("[build] keeping cached limits snapshot");
+      limitsMemo = { limits: cached.limits, at: Date.now() };
       return cached.limits;
     }
     throw new Error("Go docs limits unavailable and nothing cached");
   }
   await kv.set(KV_GO_LIMITS, { limits: refreshed, fetchedAt: Date.now() });
+  limitsMemo = { limits: refreshed, at: Date.now() };
   return refreshed;
 }
 
 // ---------------------------------------------------------------------------
-// KV store
+// Workers bindings + KV adapter
+// ---------------------------------------------------------------------------
+// This app only ever used the get/set/delete/list subset of Deno KV (no
+// transactions), so it sits behind a KvLike interface that Workers KV
+// implements below. Array keys map to slash-joined, URI-encoded strings, so
+// no model id can collide with the separator.
+
+type KvEntry<T> = { key: string[]; value: T | null };
+
+interface KvLike {
+  get<T>(key: string[]): Promise<{ value: T | null }>;
+  set(key: string[], value: unknown): Promise<void>;
+  delete(key: string[]): Promise<void>;
+  // Deno KV auto-paginates; the adapter loops Workers KV cursors for us.
+  list<T>(opts: { prefix: string[] }): AsyncIterable<KvEntry<T>>;
+}
+
+// Structural subset of a Workers KV binding, so the project typechecks
+// without generated bindings (works for both wrangler dev and deploy).
+interface WorkersKvBinding {
+  get(key: string, type: "json"): Promise<unknown>;
+  put(key: string, value: string): Promise<void>;
+  delete(key: string): Promise<void>;
+  list(opts: {
+    prefix?: string;
+    cursor?: string;
+    limit?: number;
+  }): Promise<{
+    keys: { name: string }[];
+    list_complete: boolean;
+    cursor?: string;
+  }>;
+}
+
+// Everything the handler needs from the Workers runtime. AA_API_KEY is set
+// with `wrangler secret put AA_API_KEY`; locally it comes from .dev.vars.
+interface WorkerEnv {
+  KV: WorkersKvBinding;
+  AA_API_KEY?: string;
+}
+
+const kvKey = (key: string[]): string => key.map(encodeURIComponent).join("/");
+
+const kvUnkey = (key: string): string[] =>
+  key.split("/").map(decodeURIComponent);
+
+function workersKv(ns: WorkersKvBinding): KvLike {
+  return {
+    get: <T,>(key: string[]) =>
+      ns.get(kvKey(key), "json").then((value) => ({
+        value: (value ?? null) as T | null,
+      })),
+    set: (key, value) => ns.put(kvKey(key), JSON.stringify(value)),
+    delete: (key) => ns.delete(kvKey(key)),
+    list: <T,>(opts: { prefix: string[] }) => ({
+      async *[Symbol.asyncIterator]() {
+        let cursor: string | undefined;
+        do {
+          const page = await ns.list({ prefix: kvKey(opts.prefix), cursor });
+          for (const k of page.keys) {
+            const value = await ns.get(k.name, "json");
+            yield { key: kvUnkey(k.name), value: (value ?? null) as T | null };
+          }
+          cursor = page.list_complete ? undefined : page.cursor;
+        } while (cursor);
+      },
+    }),
+  };
+}
+
+// Bound from env on every fetch; Workers guarantees a single event loop per
+// isolate, so module-level state is safe (and is what makes the memos below
+// worth having).
+let kv!: KvLike;
+let aaApiKey = "";
+
+// ---------------------------------------------------------------------------
+// KV keys
 // ---------------------------------------------------------------------------
 
-const kv = await Deno.openKv();
 const KV_GO_IDS = ["go", "ids"];
 const KV_GO_CHECKED = ["go", "checkedAt"];
 const KV_GO_REFRESH = ["go", "refreshAt"];
@@ -392,9 +494,11 @@ async function fetchModelOnce(
 
 const AA_BASE = "https://artificialanalysis.ai/api/v2";
 const AA_BULK_TTL_MS = 24 * 60 * 60 * 1000;
-// Deno KV values cap at 64KiB, so the full AA catalog (~1000 models with
-// pricing/performance) can never fit in one key. We persist only the compact
-// per-Go-model subset, one small key per model.
+// The full AA catalog (~1000 models with pricing/performance) is far more
+// than one page needs, so we persist only the compact per-Go-model subset,
+// one small key per model. Per-model keys also make concurrent tick writes
+// conflict-free: a single combined key would be a read-modify-write race
+// when two tabs tick at once.
 const KV_AA_BULK = ["aa", "bulk"];
 const KV_AA_MODEL_PREFIX = ["aa", "model"];
 const KV_AA_DIST_PREFIX = ["aa", "dist"];
@@ -537,7 +641,7 @@ async function fetchAaBulk(
   force = false,
   goIds: string[] = [],
 ): Promise<AaBulkModel[] | null> {
-  const apiKey = Deno.env.get("AA_API_KEY") ?? "";
+  const apiKey = aaApiKey;
   if (!apiKey) return null;
   if (!force) {
     const cached = await loadAaShard();
@@ -569,7 +673,7 @@ async function fetchAaBulk(
     vals.sort((x, y) => x - y);
     if (vals.length) await kv.set(kvAaDistKey(b.slug), vals);
   }
-  // Persist only Go-matched compact models (tiny keys, no 64KiB issue).
+  // Persist only Go-matched compact models (tiny keys, one write per model).
   // Drop the legacy single-key cache if present.
   await kv.delete(KV_AA_BULK);
   let stored = 0;
@@ -611,27 +715,39 @@ function aaCoveredIds(idx: Map<string, AaBulkModel>, goIds: string[]): Set<strin
   return covered;
 }
 
+// In-isolate memo (see MEMO_TTL_MS). Loading the shard is a KV list plus
+// per-key reads, and getAaData runs on every page load AND every tick, so
+// memoizing it is what keeps steady-state KV usage near zero. The refresh
+// handler clears it after rewriting the shards.
+let aaMemo: { data: AaData | null; at: number } | null = null;
+
+function invalidateAaMemo(): void {
+  aaMemo = null;
+}
+
 async function getAaData(
   goIds: string[] = [],
 ): Promise<AaData | null> {
-  const apiKey = Deno.env.get("AA_API_KEY") ?? "";
-  if (!apiKey) return null;
+  if (aaMemo && Date.now() - aaMemo.at < MEMO_TTL_MS) return aaMemo.data;
+  if (!aaApiKey) return null;
+  let data: AaData | null = null;
   try {
     const cached = await loadAaShard();
     if (cached) {
-      return { idx: buildAaIndex(cached), dists: await loadAaDists() };
+      data = { idx: buildAaIndex(cached), dists: await loadAaDists() };
+    } else {
+      const models = await fetchAaBulk(false, goIds);
+      if (models) data = { idx: buildAaIndex(models), dists: await loadAaDists() };
     }
-    const models = await fetchAaBulk(false, goIds);
-    if (!models) return null;
-    return { idx: buildAaIndex(models), dists: await loadAaDists() };
   } catch (e) {
     console.log(`[build] AA bulk failed, fallback to CloudPrice: ${(e as Error).message}`);
     const cached = await loadAaShard();
     if (cached) {
-      return { idx: buildAaIndex(cached), dists: await loadAaDists() };
+      data = { idx: buildAaIndex(cached), dists: await loadAaDists() };
     }
-    return null;
   }
+  aaMemo = { data, at: Date.now() };
+  return data;
 }
 
 async function getAaIndex(
@@ -1158,11 +1274,15 @@ async function tick(
     if (r.kind === "rateLimited") {
       return { fetched: false, id: null, remaining: await countPending(goIds), retryAfterMs: r.retryAfterMs };
     }
-    // "error": transient failure — burn the rest of the tick budget waiting
-    // so the client doesn't hammer the API again immediately.
-    const waitMs = Math.max(0, deadlineMs - Date.now());
-    if (waitMs > 0) await sleep(waitMs);
-    return { fetched: false, id: null, remaining: await countPending(goIds), retryAfterMs: null };
+    // "error": transient failure. Hand the backoff to the client instead of
+    // sleeping out the tick budget: the client already waits out retryAfterMs
+    // (floor 10s), so the API isn't hammered either way.
+    return {
+      fetched: false,
+      id: null,
+      remaining: await countPending(goIds),
+      retryAfterMs: 5000,
+    };
   }
   return { fetched: false, id: null, remaining: await countPending(goIds), retryAfterMs: null };
 }
@@ -1224,26 +1344,22 @@ function escapeHtml(s: string): string {
   );
 }
 
-// Read fresh every request so template edits apply under watch mode without a
-// restart (index.html isn't an import, so --watch doesn't track it).
-const readHtml = () => Deno.readTextFile(new URL("./index.html", import.meta.url));
-
-async function renderHtml(data: BuildState): Promise<string> {
+function renderHtml(data: BuildState): string {
   const { rows, benchmarks } = data;
   const rowJson = JSON.stringify(rows).replace(/</g, "\\u003c");
   const benchJson = JSON.stringify(benchmarks).replace(/</g, "\\u003c");
   const buildJson = JSON.stringify(
     { remaining: data.remaining, retryAfterMs: data.retryAfterMs },
   ).replace(/</g, "\\u003c");
-  return (await readHtml())
+  return HTML_PAGE
     .replace("__updatedAt__", escapeHtml(data.updatedAt))
     .replace("__rowJson__", rowJson)
     .replace("__benchJson__", benchJson)
     .replace("__buildJson__", buildJson);
 }
 
-async function serveHtml(data: BuildState): Promise<Response> {
-  return new Response(await renderHtml(data), {
+function serveHtml(data: BuildState): Response {
+  return new Response(renderHtml(data), {
     headers: {
       "content-type": "text/html; charset=utf-8",
       "cache-control": "public, max-age=60",
@@ -1266,8 +1382,7 @@ async function handler(req: Request): Promise<Response> {
 
   // Static files.
   if (url.pathname === "/index.js") {
-    const js = await Deno.readTextFile(new URL("./index.js", import.meta.url));
-    return new Response(js, {
+    return new Response(CLIENT_JS, {
       headers: {
         "content-type": "application/javascript; charset=utf-8",
         "cache-control": "public, max-age=3600",
@@ -1275,8 +1390,7 @@ async function handler(req: Request): Promise<Response> {
     });
   }
   if (url.pathname === "/index.css") {
-    const css = await Deno.readTextFile(new URL("./index.css", import.meta.url));
-    return new Response(css, {
+    return new Response(CLIENT_CSS, {
       headers: {
         "content-type": "text/css; charset=utf-8",
         "cache-control": "public, max-age=3600",
@@ -1374,12 +1488,15 @@ async function handler(req: Request): Promise<Response> {
       } catch (e) {
         console.log(`[build] AA refresh failed: ${(e as Error).message}`);
       }
+      // Shards and dists were rewritten above: drop the in-isolate memo so
+      // the assemble below reads the fresh state.
+      invalidateAaMemo();
       goIds = live;
     }
 
     const state = await assembleBuild(goIds);
     console.log(`[perf] assembleBuild ${(performance.now() - t2).toFixed(1)}ms`);
-    return await serveHtml(state);
+    return serveHtml(state);
   } catch (e) {
     const msg = (e as Error).message;
     return new Response(
@@ -1392,7 +1509,13 @@ async function handler(req: Request): Promise<Response> {
   }
 }
 
-const PORT = Number(Deno.env.get("PORT") ?? "8001") || 8001;
-console.log(`[boot] AA ${(Deno.env.get("AA_API_KEY") ?? "") ? "on" : "off"}, PORT=${PORT}`);
-Deno.serve({ port: PORT }, handler);
-export default handler;
+// Cloudflare Workers entry point. env carries the KV binding and secrets;
+// binding them per-request replaces both Deno.openKv() (top-level await) and
+// Deno.env, and lets wrangler dev inject .dev.vars locally.
+export default {
+  fetch(req: Request, env: WorkerEnv): Promise<Response> {
+    kv = workersKv(env.KV);
+    aaApiKey = env.AA_API_KEY ?? "";
+    return handler(req);
+  },
+};

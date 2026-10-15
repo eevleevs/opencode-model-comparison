@@ -1,0 +1,33 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "opencode-model-comparison",
+  "main": "main.ts",
+  // Node-compat default date per Cloudflare's 2026 guidance; the app itself
+  // doesn't need any compat flags.
+  "compatibility_date": "2026-08-04",
+  // index.html/js/css are imported as text modules (the same shape
+  // Deno.readTextFile gave the old Deno Deploy version). Globs are matched
+  // against the import specifier, not the file path, so they must be written
+  // as "./index.js": a bare "index.js" never matches "./index.js", and a
+  // wildcard "*.js" also matches wrangler's own injected watch stub
+  // (node_modules/wrangler/templates/modules-watch-stub.js), which esbuild
+  // then refuses to mark as external.
+  "rules": [
+    {
+      "type": "Text",
+      "globs": ["./index.html", "./index.js", "./index.css"],
+      // Keep wrangler's default Text rule (**/*.txt, **/*.html, **/*.sql)
+      // active as a fallback instead of shadowing it.
+      "fallthrough": true
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "KV",
+      // Replace with the id from `bunx wrangler kv namespace create KV`
+      // (see README). All-zero is a syntactically valid placeholder so
+      // `deno task dev` works before the namespace exists.
+      "id": "00000000000000000000000000000000"
+    }
+  ]
+}

@@ -1,3 +1,7 @@
 server.log
 server.err.log
 .env
+.dev.vars
+node_modules/
+.wrangler/
+dist/
