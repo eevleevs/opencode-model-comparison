@@ -15,11 +15,12 @@
   // as "./index.js": a bare "index.js" never matches "./index.js", and a
   // wildcard "*.js" also matches wrangler's own injected watch stub
   // (node_modules/wrangler/templates/modules-watch-stub.js), which esbuild
-  // then refuses to mark as external.
+  // then refuses to mark as external. "./queue.js" is served the same way and
+  // imported by the browser as a module (index.js does `import "./queue.js"`).
   "rules": [
     {
       "type": "Text",
-      "globs": ["./index.html", "./index.js", "./index.css"],
+      "globs": ["./index.html", "./index.js", "./index.css", "./queue.js"],
       // Keep wrangler's default Text rule (**/*.txt, **/*.html, **/*.sql)
       // active as a fallback instead of shadowing it.
       "fallthrough": true

@@ -17,11 +17,12 @@ The server never fetches more than **one** CloudPrice model per HTTP request:
 
 - Each model's benchmark data is persisted to Workers KV the moment it's fetched (`["model", <id>]`).
 - The page always renders immediately from whatever is in KV, no matter how many models remain.
-- The client polls `GET /?tick=1` (one model per tick, ~2.5s cadence, respect `retry-after` on 429) until all models are resolved.
-- Every successful tick returns the fetched model's data, so the table updates **live in place** without reloading; a single reload happens once `remaining` hits 0.
+- The render hands the client the cycle's **todo list** (in the `BUILD` payload); the client then polls `GET /?tick=1&next=<id>` / `&resolveCreator=<id>` (one unit of work per tick, ~2.5s cadence, respects `retry-after` on 429), popping each id only when the response says `handled`.
+- The client owns that list because Workers KV is **eventually consistent**: a read right after a write can go stale for up to a minute, so asking the server "what is still pending?" on every tick used to see pre-write state — the status line sat on "1 more model" while the same model was refetched ~10 times after `?refresh=1`. The count now drops exactly once per real action, and each id is fetched at most once per cycle.
+- Every successful tick returns the fetched model's data, so the table updates **live in place** without reloading; a single reload happens once both queues are empty.
 - Models with no public benchmarks (404/409) are stored as short-lived tombstones so ticks don't retry them, but they re-fetch after running out.
 
-The design started on Deno Deploy (which killed requests that ran too long) and stays on Cloudflare Workers: it bounds per-request work, keeps every request inside free-tier limits, and lets the page render immediately from whatever is cached (stale-while-revalidate). Adding `?refresh=1` marks all cached models for revalidation and rebuilds one model per tick.
+The design started on Deno Deploy (which killed requests that ran too long) and stays on Cloudflare Workers: it bounds per-request work, keeps every request inside free-tier limits, and lets the page render immediately from whatever is cached (stale-while-revalidate). Adding `?refresh=1` marks all cached models for revalidation and rebuilds one model per tick; the refresh epoch is echoed back on tick requests so a tick on another machine can't mistake the just-marked models for fresh ones. Requests without a queue param fall back to a legacy KV scan, so an already-cached `index.js` from before this protocol still converges.
 
 KV only ever holds a **rebuildable cache** — there is no data to migrate, and a fresh namespace simply rebuilds itself as visitors arrive.
 
@@ -50,12 +51,13 @@ Manual checks:
 
 ```sh
 bun run check    # tsc --noEmit against Workers types
-deno task test   # unit tests (pure.ts helpers, offline; runs under Deno)
+deno task test   # unit tests (pure.ts helpers + queue.js, offline; runs under Deno)
 ```
 
 ## Repo layout
 
-- `main.ts` — Workers fetch handler, Workers KV adapter, one-model tick endpoint, HTML render
+- `main.ts` — Workers fetch handler, Workers KV adapter, targeted tick endpoint, HTML render
 - `pure.ts` / `pure_test.ts` — side-effect-free helpers + unit tests
 - `index.html` / `index.js` / `index.css` — client, including the tick-polling + live-update loop (bundled as text modules via `wrangler.jsonc` `rules`)
+- `queue.js` — client tick-queue helpers, shared verbatim between `index.js` (module import) and `pure_test.ts`, so tests cover the shipped bookkeeping
 - `wrangler.jsonc` — Workers config: entry point, KV binding, text-module rules

@@ -15,6 +15,9 @@ import {
   pendingCreatorModels,
   rankPercentile,
 } from "./pure.ts";
+// The browser imports this same file, so the tests cover exactly the
+// bookkeeping the poll loop runs (see queue.js).
+import { advanceTick, nextTickTarget } from "./queue.js";
 
 function assertEquals<T>(actual: T, expected: T, msg: string): void {
   const a = typeof actual === "number" && isNaN(actual) ? "NaN" : actual;
@@ -400,4 +403,90 @@ Deno.test("aaRankPercentile: min -> 0, median -> 50, max -> 100", () => {
   for (const [dist, value, expected] of cases) {
     assertEquals(aaRankPercentile(dist, value), expected, `v=${value}`);
   }
+});
+
+// --- Tick queues (queue.js) ------------------------------------------------
+
+Deno.test("nextTickTarget drains creators before benchmarks, then reports null", () => {
+  assertEquals(
+    JSON.stringify(nextTickTarget({ creators: ["a", "b"], build: ["x"] })),
+    JSON.stringify({ kind: "resolveCreator", id: "a" }),
+    "creator head wins",
+  );
+  assertEquals(
+    JSON.stringify(nextTickTarget({ creators: [], build: ["x", "y"] })),
+    JSON.stringify({ kind: "next", id: "x" }),
+    "falls to the build queue",
+  );
+  assertEquals(
+    nextTickTarget({ creators: [], build: [] }),
+    null,
+    "empty queues: no target (and so no tick, and no reload loop)",
+  );
+});
+
+Deno.test("advanceTick pops the head only on handled=true, without mutating input", () => {
+  const q = { creators: ["a", "b"], build: ["x"] };
+  const adv = advanceTick(q, { handled: true });
+  assertEquals(adv.action, "pop", "handled pops");
+  assertEquals(adv.done, false, "not done: work remains");
+  assertEquals(
+    JSON.stringify(adv.queues),
+    JSON.stringify({ creators: ["b"], build: ["x"] }),
+    "the creator head is dropped, benchmarks untouched",
+  );
+  assertEquals(JSON.stringify(q), JSON.stringify({ creators: ["a", "b"], build: ["x"] }), "input not mutated");
+
+  // The pairing rule: with the creator queue empty the target came from the
+  // build queue, so a handled response must pop there.
+  const fromBuild = advanceTick({ creators: [], build: ["x", "y"] }, { handled: true });
+  assertEquals(fromBuild.action, "pop", "handled pops build queue");
+  assertEquals(
+    fromBuild.action === "pop" ? fromBuild.queue : "?",
+    "build",
+    "pops the queue the target was taken from",
+  );
+  assertEquals(
+    JSON.stringify(fromBuild.queues),
+    JSON.stringify({ creators: [], build: ["y"] }),
+    "build head dropped",
+  );
+});
+
+Deno.test("advanceTick reports done on the last pop", () => {
+  const last = advanceTick({ creators: [], build: ["only"] }, { handled: true });
+  assertEquals(last.action, "pop", "pops");
+  assertEquals(last.done, true, "last item gone: cycle complete");
+});
+
+Deno.test("advanceTick keeps the head on rate limits, transient errors, and bad bodies", () => {
+  const q = { creators: ["a"], build: ["x"] };
+  // Second tuple element typed via the helper's own parameter type so the
+  // deliberately-loose reports below still satisfy it.
+  type Report = Parameters<typeof advanceTick>[1];
+  const cases: Array<[Report, string]> = [
+    [{ handled: false, retryAfterMs: 30_000 }, "explicit not-handled"],
+    [{ handled: false, retryAfterMs: null }, "not handled, no backoff"],
+    [{}, "body without handled"],
+    [{ handled: "yes" }, "handled is not the boolean true"],
+    [null, "null body"],
+    [undefined, "missing body"],
+  ];
+  for (const [report, msg] of cases) {
+    const adv = advanceTick(q, report);
+    assertEquals(adv.action, "retry", `${msg}: retries instead of popping`);
+    assertEquals(adv.done, false, `${msg}: never claims done`);
+    assertEquals(
+      JSON.stringify(adv.queues),
+      JSON.stringify(q),
+      `${msg}: queue untouched`,
+    );
+  }
+  // Backoff: honours retry-after, floors it at 10s, null for the normal pace.
+  const limited = advanceTick(q, { handled: false, retryAfterMs: 500 });
+  assertEquals(limited.action === "retry" ? limited.delayMs : -1, 10_000, "tiny retry-after is floored at 10s");
+  const long = advanceTick(q, { handled: false, retryAfterMs: 45_000 });
+  assertEquals(long.action === "retry" ? long.delayMs : -1, 45_100, "real retry-after is honoured (+100ms)");
+  const plain = advanceTick(q, { handled: false });
+  assertEquals(plain.action === "retry" ? plain.delayMs : -1, null, "no retry-after: normal tick pace");
 });

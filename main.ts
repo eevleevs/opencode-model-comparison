@@ -163,6 +163,7 @@ import {
 import CLIENT_CSS from "./index.css";
 import CLIENT_JS from "./index.js";
 import HTML_PAGE from "./index.html";
+import QUEUE_JS from "./queue.js";
 
 // The docs publish the request-limits table once per plan ("Go" and "Go Plus")
 // with identical headers. They used to differ enough to be distinguishable, so
@@ -827,11 +828,17 @@ function markCreatorEmpty(state: CreatorState, id: string): void {
 // Seed from the AA bulk we already hold. Free, and it means the models AA
 // covers never cost a CloudPrice call. Also upgrades an empty creator if AA
 // has started covering a model it previously missed.
+//
+// `initial` skips the KV read: right after ?refresh=1 clears the key, a
+// read-back can resurrect the pre-refresh state (Workers KV reads go stale
+// after a write), and this request's own todo list must be computed from the
+// cleared state instead.
 async function seedCreatorsFromAa(
   goIds: string[],
   idx: Map<string, AaBulkModel> | null,
+  initial?: CreatorState,
 ): Promise<CreatorState> {
-  const state = await loadCreatorState();
+  const state = initial ?? await loadCreatorState();
   if (!idx) return state;
   let changed = false;
   for (const id of goIds) {
@@ -886,37 +893,57 @@ async function lookupCreator(cpiId: string): Promise<CreatorLookup> {
   }
 }
 
-// Resolve at most one model's creator per request, keeping the tick's
-// one-CloudPrice-call-per-request invariant.
-async function tickCreator(
+// Resolve ONE specific model's creator, keeping the tick's
+// one-CloudPrice-call-per-request invariant. `handled: false` means "spend the
+// next tick on the same id" (rate limit, transient error, or an ambiguous
+// answer whose exact-id retry has just been armed) — the model stays pending.
+async function tickCreatorFor(
   goIds: string[],
   aaIdx: Map<string, AaBulkModel> | null,
+  id: string,
+  initial?: CreatorState,
 ): Promise<{
-  touched: boolean;
+  handled: boolean;
+  creator: string | null;
   retryAfterMs: number | null;
 }> {
   // Seed from AA first: a manual refresh drops the memo, and without this the
   // models AA already covers would each cost a CloudPrice call.
-  const state = await seedCreatorsFromAa(goIds, aaIdx);
+  const state = initial ?? await seedCreatorsFromAa(goIds, aaIdx);
   const pending = pendingCreatorModels(
     goIds,
     state.creators,
     state.families,
     state.retried,
   );
-  if (!pending.length) return { touched: false, retryAfterMs: null };
+  if (!pending.includes(id)) {
+    // Already settled (another request, or a family hint that now answers it):
+    // no call spent, report the effective creator so the client drops its head.
+    return {
+      handled: true,
+      creator: knownCreator(id, undefined, state.creators, state.families) ||
+        null,
+      retryAfterMs: null,
+    };
+  }
 
-  const id = pending[0];
   const cpiId = state.pendingCandidate[id] ?? id;
   const r = await lookupCreator(cpiId);
 
   if (r.kind === "rateLimited") {
     // Nothing persisted: the model stays pending and the client waits out the
     // retry-after.
-    return { touched: true, retryAfterMs: r.retryAfterMs };
+    return { handled: false, creator: null, retryAfterMs: r.retryAfterMs };
+  }
+  if (r.kind === "error") {
+    // Transient failure. Unlike a 404 this says nothing about the model, so
+    // keep it pending and retry later instead of blanking the Creator column
+    // for a week (what markCreatorEmpty would cost).
+    return { handled: false, creator: null, retryAfterMs: 5000 };
   }
 
   let outcome: string;
+  let retryNext = false;
   if (r.kind === "ok") {
     markCreatorResolved(state, id, r.creator);
     outcome = "ok";
@@ -930,16 +957,19 @@ async function tickCreator(
     } else if (!state.pendingCandidate[id]) {
       // One in-cycle retry against an exact candidate id, which bypasses the
       // fuzzy match that produced the ambiguity in the first place. Bounded:
-      // the second ambiguous answer falls through to empty below.
+      // the second ambiguous answer falls through to empty below. Not handled
+      // yet: the client keeps the id at its queue head and the next tick
+      // spends its slot on that exact id.
       state.pendingCandidate[id] = r.candidates[0];
       outcome = "ambiguous, retrying exact id";
+      retryNext = true;
     } else {
       markCreatorEmpty(state, id);
       outcome = "ambiguous";
     }
   } else {
-    // 404, or a transient error. Either way we have no creator to show, so
-    // carry it empty and retry once at the next refresh.
+    // 404: this id does not exist upstream, so there is no creator to show.
+    // Carry it empty and retry once at the next manual refresh.
     markCreatorEmpty(state, id);
     outcome = r.kind;
   }
@@ -948,7 +978,40 @@ async function tickCreator(
   console.log(
     `[creator] ${id} -> ${state.creators[id] || "(empty)"} via ${cpiId} (${outcome})`,
   );
-  return { touched: true, retryAfterMs: null };
+  if (retryNext) {
+    return { handled: false, creator: null, retryAfterMs: null };
+  }
+  return {
+    handled: true,
+    creator: knownCreator(id, undefined, state.creators, state.families) || null,
+    retryAfterMs: null,
+  };
+}
+
+// Legacy picker (no explicit target in the request): resolve the first pending
+// model, so an old cached index.js still converges one creator per tick.
+async function tickCreator(
+  goIds: string[],
+  aaIdx: Map<string, AaBulkModel> | null,
+): Promise<{
+  touched: boolean;
+  handled: boolean;
+  id: string | null;
+  retryAfterMs: number | null;
+}> {
+  const state = await seedCreatorsFromAa(goIds, aaIdx);
+  const pending = pendingCreatorModels(
+    goIds,
+    state.creators,
+    state.families,
+    state.retried,
+  );
+  if (!pending.length) {
+    return { touched: false, handled: false, id: null, retryAfterMs: null };
+  }
+  const id = pending[0];
+  const r = await tickCreatorFor(goIds, aaIdx, id, state);
+  return { touched: true, handled: r.handled, id, retryAfterMs: r.retryAfterMs };
 }
 
 // ---------------------------------------------------------------------------
@@ -1015,6 +1078,79 @@ function setsEqual(a: string[], b: string[]): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// The cycle's todo list
+// ---------------------------------------------------------------------------
+// Computed ONCE per page render and handed to the client, which ticks through
+// it. Asking KV "what is still pending?" on every tick looked at reads right
+// after this loop's own writes, and Workers KV serves those stale for up to a
+// minute — the status line kept counting the same model and CloudPrice was
+// asked for it ~10 times in a row. Recomputing is only done by the legacy
+// fallback in tick() (no `next`/`resolveCreator` param), for old cached JS.
+
+async function loadModelEntries(): Promise<Map<string, CachedModel>> {
+  const entries = new Map<string, CachedModel>();
+  const it = kv.list<CachedModel>({ prefix: ["model"] });
+  for await (const entry of it) {
+    const id = String(entry.key[1]);
+    if (entry.value) entries.set(id, entry.value);
+  }
+  return entries;
+}
+
+type PendingLists = { pendingCreators: string[]; pendingBuild: string[] };
+
+function pendingLists(
+  goIds: string[],
+  opts: {
+    covered: Set<string>;
+    creatorState: CreatorState;
+    refreshAt: number;
+    entries: Map<string, CachedModel>;
+    now?: number;
+  },
+): PendingLists {
+  const now = opts.now ?? Date.now();
+  const pendingCreators = pendingCreatorModels(
+    goIds,
+    opts.creatorState.creators,
+    opts.creatorState.families,
+    opts.creatorState.retried,
+  );
+  const pendingBuild: string[] = [];
+  for (const id of goIds) {
+    // AA-covered models resolve via bulk, never via ticks.
+    if (opts.covered.has(id)) continue;
+    const cached = opts.entries.get(id);
+    if (!cached) {
+      pendingBuild.push(id);
+      continue;
+    }
+    // Revalidate everything older than this refresh epoch, plus everything
+    // that has aged past the auto-refresh window.
+    if (cached.fetchedAt < opts.refreshAt) {
+      pendingBuild.push(id);
+      continue;
+    }
+    if (now - cached.fetchedAt >= STALE_TTL_MS) pendingBuild.push(id);
+  }
+  return { pendingCreators, pendingBuild };
+}
+
+function remainingOf(p: PendingLists): number {
+  return p.pendingCreators.length + p.pendingBuild.length;
+}
+
+// `remaining` after `id` was handled. Computed from the pre-write snapshot:
+// reading KV back after the write is exactly the stale read this design exists
+// to avoid.
+function remainingAfter(p: PendingLists, id: string | null): number {
+  if (!id) return remainingOf(p);
+  const inCreators = p.pendingCreators.includes(id);
+  const inBuild = p.pendingBuild.includes(id);
+  return remainingOf(p) - (inCreators || inBuild ? 1 : 0);
+}
+
+// ---------------------------------------------------------------------------
 // Assemble leaderboard from KV
 // ---------------------------------------------------------------------------
 
@@ -1039,21 +1175,40 @@ type BuildState = {
   benchmarks: typeof BENCHMARKS;
   updatedAt: string;
   remaining: number;
+  // The cycle's todo list, embedded in BUILD for the client to tick through
+  // (see "The cycle's todo list" above).
+  pendingCreators: string[];
+  pendingBuild: string[];
+  // Refresh epoch for this page, echoed back on tick requests: a tick landing
+  // on another machine can still read the pre-refresh KV_GO_REFRESH, and
+  // without the echo the refetch it was asked for would be skipped as "fresh".
+  refreshAt: number;
   retryAfterMs: number | null;
 };
 
-async function assembleBuild(goIds: string[]): Promise<BuildState> {
+async function assembleBuild(
+  goIds: string[],
+  opts: {
+    // In-memory refresh epoch / creator state: passed by the ?refresh=1
+    // handler, which just wrote them and must not read them back (stale).
+    refreshAt?: number;
+    creatorState?: CreatorState;
+  } = {},
+): Promise<BuildState> {
   // Load any Go limits we already have; never fetch them in the hot path.
+  // The in-isolate memo first: right after ?refresh=1 writes the snapshot,
+  // the KV read-back can serve the pre-refresh copy (Workers KV), so the
+  // just-refreshed limits would miss this one render. The memo holds the very
+  // values that request wrote, or something fetched within MEMO_TTL_MS.
   let goLimits: Record<string, GoLimit> = {};
-  const limitsEntry = await kv.get<GoLimits>(KV_GO_LIMITS);
-  if (limitsEntry.value) goLimits = limitsEntry.value.limits;
-
-  const entries = new Map<string, CachedModel>();
-  const it = kv.list<CachedModel>({ prefix: ["model"] });
-  for await (const entry of it) {
-    const id = String(entry.key[1]);
-    if (entry.value) entries.set(id, entry.value);
+  if (limitsMemo && Date.now() - limitsMemo.at < MEMO_TTL_MS) {
+    goLimits = limitsMemo.limits;
+  } else {
+    const limitsEntry = await kv.get<GoLimits>(KV_GO_LIMITS);
+    if (limitsEntry.value) goLimits = limitsEntry.value.limits;
   }
+
+  const entries = await loadModelEntries();
 
   // AA bulk is primary for values AND rank percentiles; CloudPrice KV is
   // fallback for AA-misses (values + percentiles) and percentiles where
@@ -1061,10 +1216,14 @@ async function assembleBuild(goIds: string[]): Promise<BuildState> {
   const aaData = await getAaData(goIds);
   const aaIdx = aaData?.idx ?? null;
   const aaDists = aaData?.dists ?? null;
+  const covered = aaIdx ? aaCoveredIds(aaIdx, goIds) : new Set<string>();
+
+  const refreshAt = opts.refreshAt ??
+    (await kv.get<number>(KV_GO_REFRESH)).value ?? 0;
 
   // Memoized first-word -> creator. Also seeds every token AA covers, so most
   // tokens never need a CloudPrice call.
-  const creatorState = await seedCreatorsFromAa(goIds, aaIdx);
+  const creatorState = await seedCreatorsFromAa(goIds, aaIdx, opts.creatorState);
   const creatorTokens = creatorState.creators;
   const creatorFamilies = creatorState.families;
 
@@ -1167,53 +1326,201 @@ async function assembleBuild(goIds: string[]): Promise<BuildState> {
     });
   }
 
-  const remaining = await countPending(goIds, creatorState);
+  const lists = pendingLists(goIds, { covered, creatorState, refreshAt, entries });
 
   console.log(
-    `[tick] assemble: ${matchedCount}/${goIds.length} matched, ${remaining} pending, aaFilled=${aaFilled}, aaPct=${aaPctFilled}, emptyReasons=${JSON.stringify(emptyReasons)}, aa=${aaIdx ? "on" : "off"}, limits=${limitsCount}/${goIds.length} noLimits=[${noLimits.join(",")}]`,
+    `[tick] assemble: ${matchedCount}/${goIds.length} matched, ${remainingOf(lists)} pending (creators=${lists.pendingCreators.length} build=${lists.pendingBuild.length}), aaFilled=${aaFilled}, aaPct=${aaPctFilled}, emptyReasons=${JSON.stringify(emptyReasons)}, aa=${aaIdx ? "on" : "off"}, limits=${limitsCount}/${goIds.length} noLimits=[${noLimits.join(",")}]`,
   );
 
   return {
     rows,
     benchmarks: BENCHMARKS,
     updatedAt: new Date().toISOString(),
-    remaining,
+    remaining: remainingOf(lists),
+    pendingCreators: lists.pendingCreators,
+    pendingBuild: lists.pendingBuild,
+    refreshAt,
     retryAfterMs: null,
   };
 }
 
 // ---------------------------------------------------------------------------
-// Tick: fetch exactly one missing model, persist it, report progress
+// Tick: do exactly one unit of work, persist it, report progress
 // ---------------------------------------------------------------------------
 // CloudPrice ticks cover only AA-misses: AA is primary (values + rank
 // percentiles), so re-ticking AA-covered models would overwrite fresher
 // data with the lagging snapshot. Without an AA key, all models tick.
+//
+// The modern client names the unit of work (`target`: see the handler), so a
+// tick never picks its target by scanning KV — and `remaining` is always
+// derived from the pre-write snapshot in `lists`, never from a read-back.
+// Clients without a queue fall into the legacy scan below.
 
-async function tick(
-  goIds: string[],
-  deadlineMs: number,
-): Promise<{
-  fetched: boolean;
+type TickTarget = {
+  // Model whose benchmarks should be fetched this tick.
+  next?: string;
+  // Model whose creator should be resolved this tick.
+  resolveCreator?: string;
+  // Refresh epoch echoed from the page (see BuildState.refreshAt).
+  refreshAt?: number;
+};
+
+type TickResult = {
+  // True when the requested unit of work is complete and the client should
+  // drop it from its queue (fetched / empty / already fresh / creator
+  // settled). False on rate limits and transient failures: the head stays.
+  handled: boolean;
+  kind: "fetched" | "empty" | "creator" | "noop";
   id: string | null;
+  creator?: string | null;
   value?: Record<string, number>;
   percentile?: Record<string, number>;
   remaining: number;
   retryAfterMs: number | null;
-}> {
-  const refreshAt = (await kv.get<number>(KV_GO_REFRESH)).value ?? 0;
+  // Legacy field for pre-queue clients (old cached index.js): they only know
+  // to patch a row when `fetched && id && value`.
+  fetched: boolean;
+};
+
+// One CloudPrice fetch + its KV write, folded into a response fragment.
+// Shared by the targeted path and the legacy scan so both report identically.
+async function fetchAndStore(
+  id: string,
+): Promise<
+  | { kind: "fetched"; value: Record<string, number>; percentile: Record<string, number> }
+  | { kind: "empty" }
+  | { kind: "retry"; retryAfterMs: number | null }
+> {
+  const r = await fetchModelOnce(id);
+  if (r.kind === "ok") {
+    await kv.set(kvModelKey(id), {
+      data: r.data,
+      fetchedAt: Date.now(),
+    });
+    console.log(`[tick] fetched ${id}`);
+    // Recompute percentiles with the uniform rank logic so live-patched
+    // rows match what assembleBuild() renders.
+    const pct: Record<string, number> = {};
+    for (const k of Object.keys(r.data.value)) {
+      const rk = r.data.rank?.[k];
+      const tot = r.data.total?.[k];
+      const recomputed = rk != null && tot != null
+        ? rankPercentile(rk, tot)
+        : NaN;
+      const v = !isNaN(recomputed) ? recomputed : r.data.percentile[k];
+      if (typeof v === "number") pct[k] = v;
+    }
+    return { kind: "fetched", value: r.data.value, percentile: pct };
+  }
+  if (r.kind === "empty") {
+    await kv.set(kvModelKey(id), {
+      empty: true,
+      fetchedAt: Date.now(),
+      reason: r.reason,
+      sourcesCount: r.sourcesCount,
+    });
+    console.log(`[tick] recorded empty for ${id} reason=${r.reason}`);
+    return { kind: "empty" };
+  }
+  if (r.kind === "rateLimited") {
+    console.log(`[tick] 429 on ${id}, retry in ${r.retryAfterMs}ms`);
+    return { kind: "retry", retryAfterMs: r.retryAfterMs };
+  }
+  // Transient failure. Hand the backoff to the client instead of sleeping out
+  // the tick budget: the client waits it out (floor 10s), so the API isn't
+  // hammered either way, and the id stays at the head of its queue.
+  return { kind: "retry", retryAfterMs: 5000 };
+}
+
+async function tick(
+  goIds: string[],
+  deadlineMs: number,
+  target: TickTarget = {},
+): Promise<TickResult> {
+  const kvRefreshAt = (await kv.get<number>(KV_GO_REFRESH)).value ?? 0;
+  // The page that started a refresh echoes its epoch: a tick landing on
+  // another machine can read the pre-refresh KV_GO_REFRESH for up to a minute,
+  // which would skip the refetch it was asked for as "fresh". Clamped to now
+  // so a bogus client value can only force refetches of ids already queued.
+  const echoed = Number(target.refreshAt);
+  const reqRefreshAt = Number.isFinite(echoed) && echoed > 0
+    ? Math.min(echoed, Date.now())
+    : 0;
+  const refreshAt = Math.max(kvRefreshAt, reqRefreshAt);
+
   const aaIdx = await getAaIndex(goIds);
   const covered = aaIdx ? aaCoveredIds(aaIdx, goIds) : new Set<string>();
+  const creatorState = await seedCreatorsFromAa(goIds, aaIdx);
+  const entries = await loadModelEntries();
+  const lists = pendingLists(goIds, { covered, creatorState, refreshAt, entries });
 
-  // Unresolved creator tokens take the tick slot when there is one. Taking it
-  // here rather than appending a call keeps the one-CloudPrice-call-per-request
-  // invariant, and creators land before the slower benchmark crawl.
+  const handled = (
+    kind: TickResult["kind"],
+    id: string | null,
+    extra: Partial<TickResult> = {},
+  ): TickResult => ({
+    handled: true,
+    kind,
+    id,
+    remaining: remainingAfter(lists, id),
+    retryAfterMs: null,
+    fetched: kind === "fetched",
+    ...extra,
+  });
+  const backoff = (retryAfterMs: number | null): TickResult => ({
+    handled: false,
+    kind: "noop",
+    id: null,
+    remaining: remainingOf(lists),
+    retryAfterMs,
+    fetched: false,
+  });
+
+  // --- Creator target ------------------------------------------------------
+  if (target.resolveCreator !== undefined) {
+    const id = target.resolveCreator;
+    if (!goIds.includes(id)) return handled("noop", null);
+    const r = await tickCreatorFor(goIds, aaIdx, id, creatorState);
+    if (!r.handled) return backoff(r.retryAfterMs);
+    return handled("creator", id, { creator: r.creator });
+  }
+
+  // --- Benchmark target ----------------------------------------------------
+  if (target.next !== undefined) {
+    const id = target.next;
+    // The queue came from an earlier render: if AA now covers the id, or it
+    // left the Go list, or another tab already refetched it, there is nothing
+    // to spend a call on — report done so the client pops the head.
+    if (!goIds.includes(id) || covered.has(id)) return handled("noop", null);
+    const cached = entries.get(id);
+    const now = Date.now();
+    if (
+      cached && cached.fetchedAt >= refreshAt &&
+      now - cached.fetchedAt < STALE_TTL_MS
+    ) {
+      return handled("noop", id);
+    }
+    if (now > deadlineMs) return backoff(null);
+    const r = await fetchAndStore(id);
+    if (r.kind === "retry") return backoff(r.retryAfterMs);
+    if (r.kind === "empty") return handled("empty", id);
+    return handled("fetched", id, { value: r.value, percentile: r.percentile });
+  }
+
+  // --- Legacy client (no queue params) ------------------------------------
+  // One unit of work per request, chosen by scanning KV. Kept so an old
+  // cached index.js (max-age 1h) still drives a build to completion.
   const creator = await tickCreator(goIds, aaIdx);
   if (creator.touched) {
     return {
-      fetched: false,
+      handled: creator.handled,
+      kind: "creator",
       id: null,
-      remaining: await countPending(goIds),
+      remaining: creator.handled && creator.id
+        ? remainingAfter(lists, creator.id)
+        : remainingOf(lists),
       retryAfterMs: creator.retryAfterMs,
+      fetched: false,
     };
   }
 
@@ -1223,106 +1530,20 @@ async function tick(
     // AA-covered models never need CloudPrice (values + percentiles from AA).
     if (covered.has(id)) continue;
 
-    const cached = await kv.get<CachedModel>(kvModelKey(id));
+    const cached = entries.get(id);
     // Skip fresh entries, unless a manual refresh asked for revalidation.
     // Old data stays visible until the refetch succeeds (stale-while-revalidate).
-    if (cached.value) {
-      const age = Date.now() - cached.value.fetchedAt;
-      if (cached.value.fetchedAt >= refreshAt && age < STALE_TTL_MS) continue;
+    if (cached) {
+      const age = Date.now() - cached.fetchedAt;
+      if (cached.fetchedAt >= refreshAt && age < STALE_TTL_MS) continue;
     }
 
-    const r = await fetchModelOnce(id);
-    if (r.kind === "ok") {
-      await kv.set(kvModelKey(id), {
-        data: r.data,
-        fetchedAt: Date.now(),
-      });
-      console.log(`[tick] fetched ${id}`);
-      // Recompute percentiles with the uniform rank logic so live-patched
-      // rows match what assembleBuild() renders.
-      const pct: Record<string, number> = {};
-      for (const k of Object.keys(r.data.value)) {
-        const rk = r.data.rank?.[k];
-        const tot = r.data.total?.[k];
-        const recomputed = rk != null && tot != null
-          ? rankPercentile(rk, tot)
-          : NaN;
-        const v = !isNaN(recomputed)
-          ? recomputed
-          : r.data.percentile[k];
-        if (typeof v === "number") pct[k] = v;
-      }
-      return {
-        fetched: true,
-        id,
-        value: r.data.value,
-        percentile: pct,
-        remaining: await countPending(goIds),
-        retryAfterMs: null,
-      };
-    }
-    if (r.kind === "empty") {
-      await kv.set(kvModelKey(id), {
-        empty: true,
-        fetchedAt: Date.now(),
-        reason: r.reason,
-        sourcesCount: r.sourcesCount,
-      });
-      console.log(`[tick] recorded empty for ${id} reason=${r.reason}`);
-      return { fetched: true, id, remaining: await countPending(goIds), retryAfterMs: null };
-    }
-    if (r.kind === "rateLimited") {
-      return { fetched: false, id: null, remaining: await countPending(goIds), retryAfterMs: r.retryAfterMs };
-    }
-    // "error": transient failure. Hand the backoff to the client instead of
-    // sleeping out the tick budget: the client already waits out retryAfterMs
-    // (floor 10s), so the API isn't hammered either way.
-    return {
-      fetched: false,
-      id: null,
-      remaining: await countPending(goIds),
-      retryAfterMs: 5000,
-    };
+    const r = await fetchAndStore(id);
+    if (r.kind === "retry") return backoff(r.retryAfterMs);
+    if (r.kind === "empty") return handled("empty", id);
+    return handled("fetched", id, { value: r.value, percentile: r.percentile });
   }
-  return { fetched: false, id: null, remaining: await countPending(goIds), retryAfterMs: null };
-}
-
-async function countPending(
-  goIds: string[],
-  seeded?: CreatorState,
-): Promise<number> {
-  const refreshAt = (await kv.get<number>(KV_GO_REFRESH)).value ?? 0;
-  const aaIdx = await getAaIndex(goIds);
-  const covered = aaIdx ? aaCoveredIds(aaIdx, goIds) : new Set<string>();
-  // Unresolved creator tokens count as pending so the client's poll loop keeps
-  // going; terminal negatives do not, which is what makes the loop terminate.
-  // Callers that already seeded pass the state in rather than re-reading KV.
-  const creatorState = seeded ?? await seedCreatorsFromAa(goIds, aaIdx);
-  let remaining = pendingCreatorModels(
-    goIds,
-    creatorState.creators,
-    creatorState.families,
-    creatorState.retried,
-  ).length;
-  for (const id of goIds) {
-    // AA-covered models resolve via bulk, never via ticks.
-    if (covered.has(id)) continue;
-    const cached = await kv.get<CachedModel>(kvModelKey(id));
-    if (!cached.value) {
-      remaining++;
-      continue;
-    }
-    if (cached.value.fetchedAt < refreshAt) {
-      remaining++;
-      continue;
-    }
-    const age = Date.now() - cached.value.fetchedAt;
-    if (age >= STALE_TTL_MS) {
-      remaining++;
-      continue;
-    }
-  }
-  return remaining;
+  return backoff(null);
 }
 
 // ---------------------------------------------------------------------------
@@ -1348,8 +1569,16 @@ function renderHtml(data: BuildState): string {
   const { rows, benchmarks } = data;
   const rowJson = JSON.stringify(rows).replace(/</g, "\\u003c");
   const benchJson = JSON.stringify(benchmarks).replace(/</g, "\\u003c");
+  // BUILD carries the cycle's todo list and the refresh epoch the client
+  // echoes back on ticks (see BuildState).
   const buildJson = JSON.stringify(
-    { remaining: data.remaining, retryAfterMs: data.retryAfterMs },
+    {
+      remaining: data.remaining,
+      retryAfterMs: data.retryAfterMs,
+      pendingCreators: data.pendingCreators,
+      pendingBuild: data.pendingBuild,
+      refreshAt: data.refreshAt,
+    },
   ).replace(/</g, "\\u003c");
   return HTML_PAGE
     .replace("__updatedAt__", escapeHtml(data.updatedAt))
@@ -1362,7 +1591,11 @@ function serveHtml(data: BuildState): Response {
   return new Response(renderHtml(data), {
     headers: {
       "content-type": "text/html; charset=utf-8",
-      "cache-control": "public, max-age=60",
+      // The page embeds KV-backed state and the todo list for a running
+      // refresh; max-age=60 used to serve a pre-refresh page from the browser
+      // right after a refresh finished (and the final tick-driven reload
+      // picked it up too). must-revalidate keeps every view fresh.
+      "cache-control": "no-cache, must-revalidate",
     },
   });
 }
@@ -1374,7 +1607,13 @@ function serveHtml(data: BuildState): Response {
 const json = (data: unknown, status = 200): Response =>
   new Response(JSON.stringify(data), {
     status,
-    headers: { "content-type": "application/json; charset=utf-8" },
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      // Tick/debug responses are read on a tight poll loop and drive queue
+      // decisions; a cached GET would replay a stale `remaining` and stall or
+      // duplicate work.
+      "cache-control": "no-store",
+    },
   });
 
 async function handler(req: Request): Promise<Response> {
@@ -1386,6 +1625,17 @@ async function handler(req: Request): Promise<Response> {
       headers: {
         "content-type": "application/javascript; charset=utf-8",
         "cache-control": "public, max-age=3600",
+      },
+    });
+  }
+  // Shared tick-queue helpers (imported by index.js as a module). Not URL-
+  // versioned like index.js, so it revalidates on every load instead: a stale
+  // copy paired with a fresh index.js would silently desync the queues.
+  if (url.pathname === "/queue.js") {
+    return new Response(QUEUE_JS, {
+      headers: {
+        "content-type": "application/javascript; charset=utf-8",
+        "cache-control": "no-cache, must-revalidate",
       },
     });
   }
@@ -1422,9 +1672,19 @@ async function handler(req: Request): Promise<Response> {
     const t2 = performance.now();
     console.log(`[perf] limits check ${(t2 - t1).toFixed(1)}ms`);
 
-    // Tick request: fetch at most one missing model, bounded in time.
+    // Tick request: do one unit of work, bounded in time. The modern client
+    // names the work (next/resolveCreator) and counts its own queue down;
+    // without a target we fall back to the legacy KV scan.
     if (url.searchParams.get("tick") === "1") {
-      const result = await tick(goIds, Date.now() + TICK_BUDGET_MS);
+      const numParam = (name: string): number | undefined => {
+        const v = Number(url.searchParams.get(name));
+        return Number.isFinite(v) && v > 0 ? v : undefined;
+      };
+      const result = await tick(goIds, Date.now() + TICK_BUDGET_MS, {
+        next: url.searchParams.get("next") ?? undefined,
+        resolveCreator: url.searchParams.get("resolveCreator") ?? undefined,
+        refreshAt: numParam("refreshAt"),
+      });
       return json(result);
     }
 
@@ -1473,11 +1733,21 @@ async function handler(req: Request): Promise<Response> {
       const removed = (cached.value ?? []).filter((id) => !liveSet.has(id));
       for (const id of removed) await kv.delete(kvModelKey(id));
       await kv.set(KV_GO_IDS, live);
-      await kv.set(KV_GO_REFRESH, Date.now());
-      await kv.set(KV_GO_CHECKED, Date.now());
+      const refreshAt = Date.now();
+      await kv.set(KV_GO_REFRESH, refreshAt);
+      await kv.set(KV_GO_CHECKED, refreshAt);
       // Drop memoized creators so ticks re-resolve them; AA re-seeds the
-      // tokens it covers for free.
-      await kv.delete(KV_CREATORS);
+      // tokens it covers for free. A write, not a delete: the state below is
+      // the one this request's todo list is computed from, and reading a
+      // delete back (Workers KV serves post-write reads stale) resurrected
+      // the pre-refresh retried map and shrank the queue.
+      const clearedCreators: CreatorState = {
+        creators: {},
+        families: {},
+        pendingCandidate: {},
+        retried: {},
+      };
+      await kv.set(KV_CREATORS, clearedCreators);
       try {
         await fetchGoLimits(true);
       } catch (e) {
@@ -1492,6 +1762,15 @@ async function handler(req: Request): Promise<Response> {
       // the assemble below reads the fresh state.
       invalidateAaMemo();
       goIds = live;
+
+      const state = await assembleBuild(goIds, {
+        refreshAt,
+        creatorState: clearedCreators,
+      });
+      console.log(
+        `[perf] assembleBuild ${(performance.now() - t2).toFixed(1)}ms`,
+      );
+      return serveHtml(state);
     }
 
     const state = await assembleBuild(goIds);
