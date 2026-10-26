@@ -22,6 +22,8 @@ The server never fetches more than **one** CloudPrice model per HTTP request:
 - Every successful tick returns the fetched model's data, so the table updates **live in place** without reloading; a single reload happens once both queues are empty.
 - Models with no public benchmarks (404/409) are stored as short-lived tombstones so ticks don't retry them, but they re-fetch after running out.
 
+The table is filled by an **inline script** while the document still parses, so the first paint is already the leaderboard: `index.js` is a module (deferred, and it has to fetch `queue.js` first), so a render left in there landed a frame or two after every load and the page blinked empty in between — including on the final tick-driven reload. An inline background in `<head>` keeps the frame before `/index.css` arrives dark rather than white.
+
 The design started on Deno Deploy (which killed requests that ran too long) and stays on Cloudflare Workers: it bounds per-request work, keeps every request inside free-tier limits, and lets the page render immediately from whatever is cached (stale-while-revalidate). Adding `?refresh=1` marks all cached models for revalidation and rebuilds one model per tick; the refresh epoch is echoed back on tick requests so a tick on another machine can't mistake the just-marked models for fresh ones. Requests without a queue param fall back to a legacy KV scan, so an already-cached `index.js` from before this protocol still converges.
 
 KV only ever holds a **rebuildable cache** — there is no data to migrate, and a fresh namespace simply rebuilds itself as visitors arrive.
@@ -58,6 +60,6 @@ deno task test   # unit tests (pure.ts helpers + queue.js, offline; runs under D
 
 - `main.ts` — Workers fetch handler, Workers KV adapter, targeted tick endpoint, HTML render
 - `pure.ts` / `pure_test.ts` — side-effect-free helpers + unit tests
-- `index.html` / `index.js` / `index.css` — client, including the tick-polling + live-update loop (bundled as text modules via `wrangler.jsonc` `rules`)
+- `index.html` — client shell plus the render path as an inline classic script, so the first paint already contains the rows (it also owns sort state; `index.js` calls back into its `render()`); `index.js` / `index.css` — the tick-polling + live-update loop and styling (bundled as text modules via `wrangler.jsonc` `rules`)
 - `queue.js` — client tick-queue helpers, shared verbatim between `index.js` (module import) and `pure_test.ts`, so tests cover the shipped bookkeeping
 - `wrangler.jsonc` — Workers config: entry point, KV binding, text-module rules
