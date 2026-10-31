@@ -8,6 +8,7 @@ import {
   collapseCreator,
   creatorCandidates,
   creatorFamily,
+  creatorSlug,
   findTable,
   findTables,
   knownCreator,
@@ -148,6 +149,16 @@ Deno.test("creatorFamily groups by first word, knownCreator honours precedence",
     "longcat",
     "empty memo does not shadow the family",
   );
+});
+
+Deno.test("creatorSlug derives a display-name slug for AA creators without one", () => {
+  assertEquals(creatorSlug("Anthropic"), "anthropic", "single word");
+  assertEquals(creatorSlug("Z AI"), "z-ai", "space separated");
+  assertEquals(creatorSlug("Z.AI"), "z-ai", "dot separated");
+  assertEquals(creatorSlug("OpenAI"), "openai", "kept case-insensitively");
+  assertEquals(creatorSlug("  Mistral  AI  "), "mistral-ai", "runs collapse");
+  assertEquals(creatorSlug("!!!"), "", "no alphanumerics is empty");
+  assertEquals(creatorSlug(""), "", "empty stays empty");
 });
 
 Deno.test("pendingCreatorModels counts only work that still needs doing", () => {

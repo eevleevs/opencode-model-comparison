@@ -150,6 +150,7 @@ import {
   collapseCreator,
   creatorCandidates,
   creatorFamily,
+  creatorSlug,
   findTable,
   findTables,
   knownCreator,
@@ -487,19 +488,28 @@ async function fetchModelOnce(
 }
 
 // ---------------------------------------------------------------------------
-// Artificial Analysis v2 bulk (primary) with CloudPrice fallback
-// Free tier: 100 req/day is plenty for 1 bulk/day cached in KV.
+// Artificial Analysis v2 bulk over CloudPrice
+// Free tier: 100 req/day is plenty for 1 paginated bulk/day cached in KV.
 // Needs AA_API_KEY env (server-side only, never exposed to the browser).
 // When missing, we silently fall back to CloudPrice-only.
+//
+// Since the Nov 2026 retirement of /data/* we read /language/models/free.
+// That free shape carries only the Intelligence Index among our benchmarks
+// (per-benchmark scores and creator slugs are Pro-only), so AA overlays its
+// fresher index values on rows CloudPrice still fills; coverage (aaCoveredIds)
+// is full-row only and is therefore empty on the free tier.
 // ---------------------------------------------------------------------------
 
 const AA_BASE = "https://artificialanalysis.ai/api/v2";
 const AA_BULK_TTL_MS = 24 * 60 * 60 * 1000;
+// The bulk is paginated (200/page). The cap exists only so a stuck
+// `has_more` cannot loop the fetch forever; the catalog is ~1000 models.
+const AA_MAX_PAGES = 50;
 // The full AA catalog (~1000 models with pricing/performance) is far more
-// than one page needs, so we persist only the compact per-Go-model subset,
-// one small key per model. Per-model keys also make concurrent tick writes
-// conflict-free: a single combined key would be a read-modify-write race
-// when two tabs tick at once.
+// than the leaderboard needs, so we persist only the compact per-Go-model
+// subset, one small key per model. Per-model keys also make concurrent tick
+// writes conflict-free: a single combined key would be a read-modify-write
+// race when two tabs tick at once.
 const KV_AA_BULK = ["aa", "bulk"];
 const KV_AA_MODEL_PREFIX = ["aa", "model"];
 const KV_AA_DIST_PREFIX = ["aa", "dist"];
@@ -515,13 +525,19 @@ const kvAaDistKey = (slug: string): string[] => [...KV_AA_DIST_PREFIX, slug];
 type AaBulkModel = {
   slug?: string;
   name?: string;
-  // Vendor of the model, e.g. { id, name: "Anthropic", slug: "anthropic" }.
-  // This is the creator source: present on every model in the v2 bulk payload.
+  // Vendor of the model, e.g. { id, name: "Anthropic" } on the current v2
+  // bulk (creator slug is Pro-only; aaCreatorSlug derives one from the name).
+  // This is the creator source: present on every model in the bulk payload.
   model_creator?: AaCreator;
   evaluations?: Record<string, number | null>;
 };
 
-type AaCreator = { id?: string; name?: string; slug?: string };
+type AaCreator = {
+  id?: string;
+  name?: string;
+  // Only on KV shards written before the v2 migration; new payloads have no slug.
+  slug?: string;
+};
 
 type AaBulkCache = { models: AaBulkModel[]; fetchedAt: number };
 
@@ -572,6 +588,15 @@ function lookupAa(
   goId: string,
 ): AaBulkModel | null {
   return idx.get(goId.toLowerCase()) ?? idx.get(normId(goId)) ?? null;
+}
+
+// Creator slug of an AA model. The pre-migration payload shipped `slug`
+// directly; the current v2 free shape only has `name`, so derive the same
+// shape from it ("Z AI" -> "z-ai").
+function aaCreatorSlug(m: AaBulkModel): string {
+  const c = m.model_creator;
+  if (!c) return "";
+  return c.slug ?? creatorSlug(c.name ?? "");
 }
 
 function aaValuesFor(
@@ -649,12 +674,24 @@ async function fetchAaBulk(
     if (cached) return cached;
   }
   console.log("[build] fetching AA bulk...");
-  const d = (await fetchJson(
-    `${AA_BASE}/data/llms/models`,
-    TICK_BUDGET_MS,
-    { "x-api-key": apiKey },
-  )) as { data?: AaBulkModel[] };
-  const models = d?.data ?? [];
+  // Paginated since the v2 migration: collect every page before building the
+  // index, or matching and the rank-percentile distributions would silently
+  // truncate to the first 200 models.
+  const models: AaBulkModel[] = [];
+  for (let page = 1; page <= AA_MAX_PAGES; page++) {
+    const d = (await fetchJson(
+      `${AA_BASE}/language/models/free?page=${page}`,
+      TICK_BUDGET_MS,
+      { "x-api-key": apiKey },
+    )) as {
+      data?: AaBulkModel[];
+      pagination?: { has_more?: boolean };
+    };
+    const batch = d?.data ?? [];
+    models.push(...batch);
+    // An empty page also stops the loop: a broken has_more must not spin.
+    if (!batch.length || !d?.pagination?.has_more) break;
+  }
   if (!models.length) throw new Error("AA bulk returned 0 models");
   const fullIdx = buildAaIndex(models);
   // Persist per-benchmark catalog distributions for rank percentiles.
@@ -672,7 +709,11 @@ async function fetchAaBulk(
       }
     }
     vals.sort((x, y) => x - y);
+    // Delete when empty: the pre-migration payload had values for every
+    // benchmark, and a dist left behind would keep overriding percentiles
+    // for one the free shape no longer supplies.
     if (vals.length) await kv.set(kvAaDistKey(b.slug), vals);
+    else await kv.delete(kvAaDistKey(b.slug));
   }
   // Persist only Go-matched compact models (tiny keys, one write per model).
   // Drop the legacy single-key cache if present.
@@ -693,8 +734,14 @@ async function fetchAaBulk(
     }
   }
   await kv.set(KV_AA_FETCHED, Date.now());
+  // `withValues` is the free tier's real contribution: the free shape ships
+  // every evaluation key, but mostly null. When it drops to 0 the bulk is
+  // effectively creator-seeding only, which is the signal to reconsider it.
+  const withValues = models.filter((m) =>
+    Object.keys(aaValuesFor(m).value).length > 0
+  ).length;
   console.log(
-    `[build] AA bulk: ${models.length} total, ${matched.length}/${goIds.length} Go matched, ${stored} shard keys + dists stored`,
+    `[build] AA bulk: ${models.length} total, ${withValues} with eval values, ${matched.length}/${goIds.length} Go matched, ${stored} shard keys + dists stored`,
   );
   return matched;
 }
@@ -704,12 +751,20 @@ type AaData = {
   dists: Record<string, number[]> | null;
 };
 
-// Models AA covers (any wanted value) — these skip CloudPrice ticks.
+// Models whose whole row AA can answer: every wanted benchmark has a value,
+// so a CloudPrice tick would add nothing. Coverage used to mean "any" wanted
+// value, which was equivalent under the old bulk payload (it carried the full
+// evaluation set); on the free-tier shape AA only has the Intelligence Index,
+// and "any" would exclude every model from CloudPrice ticks while 8 of 9
+// columns stayed empty. Partially covered models still tick and get their
+// missing benchmarks from CloudPrice, with AA overwriting where it has data.
 function aaCoveredIds(idx: Map<string, AaBulkModel>, goIds: string[]): Set<string> {
   const covered = new Set<string>();
   for (const id of goIds) {
     const hit = lookupAa(idx, id);
-    if (hit && Object.keys(aaValuesFor(hit).value).length > 0) {
+    if (!hit) continue;
+    const value = aaValuesFor(hit).value;
+    if (BENCHMARKS.every((b) => typeof value[b.slug] === "number")) {
       covered.add(id);
     }
   }
@@ -843,7 +898,8 @@ async function seedCreatorsFromAa(
   let changed = false;
   for (const id of goIds) {
     if (state.creators[id]) continue;
-    const slug = lookupAa(idx, id)?.model_creator?.slug;
+    const hit = lookupAa(idx, id);
+    const slug = hit ? aaCreatorSlug(hit) : "";
     if (!slug) continue;
     markCreatorResolved(state, id, slug);
     changed = true;
@@ -1210,9 +1266,10 @@ async function assembleBuild(
 
   const entries = await loadModelEntries();
 
-  // AA bulk is primary for values AND rank percentiles; CloudPrice KV is
-  // fallback for AA-misses (values + percentiles) and percentiles where
-  // catalog distributions are unavailable.
+  // AA overlays fresher values (on the free tier: the Intelligence Index) and
+  // rank percentiles from catalog distributions; CloudPrice KV fills every
+  // benchmark AA does not have, and provides percentiles where no catalog
+  // distribution exists.
   const aaData = await getAaData(goIds);
   const aaIdx = aaData?.idx ?? null;
   const aaDists = aaData?.dists ?? null;
@@ -1279,7 +1336,7 @@ async function assembleBuild(
     if (aaIdx) {
       const hit = lookupAa(aaIdx, id);
       if (hit) {
-        aaCreator = hit.model_creator?.slug ?? "";
+        aaCreator = aaCreatorSlug(hit);
         const { value } = aaValuesFor(hit);
         let filledThis = false;
         let pctThis = false;
@@ -1347,9 +1404,11 @@ async function assembleBuild(
 // ---------------------------------------------------------------------------
 // Tick: do exactly one unit of work, persist it, report progress
 // ---------------------------------------------------------------------------
-// CloudPrice ticks cover only AA-misses: AA is primary (values + rank
-// percentiles), so re-ticking AA-covered models would overwrite fresher
-// data with the lagging snapshot. Without an AA key, all models tick.
+// A model fully covered by AA never needs CloudPrice: its values and rank
+// percentiles come from the bulk, and re-ticking it would overwrite fresher
+// data with the lagging snapshot. AA-misses (on the free tier, everything
+// below full coverage) tick as if there were no AA key. Without an AA key,
+// all models tick.
 //
 // The modern client names the unit of work (`target`: see the handler), so a
 // tick never picks its target by scanning KV — and `remaining` is always
@@ -1713,7 +1772,7 @@ async function handler(req: Request): Promise<Response> {
           aa: aaHit
             ? {
               slug: aaHit.slug ?? null,
-              creator: aaHit.model_creator?.slug ?? null,
+              creator: aaCreatorSlug(aaHit) || null,
               values: aaVals,
             }
             : null,

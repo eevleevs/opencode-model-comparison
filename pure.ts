@@ -120,6 +120,16 @@ export function creatorFamily(id: string): string {
   return id.split(/[-.]/)[0] ?? "";
 }
 
+// Slug-shaped version of a creator display name, for sources that ship only
+// { id, name } (the AA v2 replacement endpoints): "Anthropic" -> "anthropic",
+// "Z AI" -> "z-ai". Never invents a creator — the caller passes a name it
+// actually received, and a nameless creator stays "".
+export function creatorSlug(name: string): string {
+  return name.toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
 // Precedence for a single model's creator. AA's per-model slug wins (it is
 // per-model and already in hand), then a memoized per-model answer, then a
 // family hint learned from a real answer. Returns "" when nothing is known, so
